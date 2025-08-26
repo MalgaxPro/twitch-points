@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>Malgax Points – Classifica</title>
+  <style>
+    :root { --twitch:#6441a5; }
+    body {
+      margin: 0; font-family: Arial, sans-serif; background:#f7f7fb; color:#222;
+      display:flex; min-height:100vh; align-items:flex-start; justify-content:center;
+    }
+    .wrap { width:100%; max-width:900px; padding:32px 16px 48px; }
+    header { display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; }
+    h1 { margin:0; font-size:24px; }
+    .actions a {
+      display:inline-block; padding:10px 14px; border-radius:8px; text-decoration:none; color:#fff; background:var(--twitch);
+    }
+    .card {
+      background:#fff; border-radius:12px; box-shadow:0 6px 18px rgba(0,0,0,0.08);
+      overflow:hidden;
+    }
+    .status { padding:14px 16px; border-bottom:1px solid #eee; font-size:14px; color:#666; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { padding:14px 12px; text-align:left; }
+    th { background:#faf7ff; color:#3b2b63; font-weight:700; border-bottom:1px solid #ece3ff; }
+    tr:not(:last-child) td { border-bottom:1px solid #f0f0f4; }
+    .rank { width:60px; font-weight:700; }
+    .points { text-align:right; width:140px; font-variant-numeric: tabular-nums; }
+    .empty { padding:24px 16px; text-align:center; color:#777; }
+    .medal { display:inline-block; width:28px; height:28px; line-height:28px; text-align:center; border-radius:50%; color:#fff; font-weight:700; }
+    .gold  { background:#f5b301; }
+    .silver{ background:#b8bcc2; }
+    .bronze{ background:#cd7f32; }
+    footer { margin-top:10px; font-size:12px; color:#8a8a8a; text-align:right; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>🏆 Classifica Utenti</h1>
+      <div class="actions">
+        <a href="/profile.html">Profilo</a>
+      </div>
+    </header>
+
+    <div class="card">
+      <div id="status" class="status">Caricamento classifica…</div>
+      <table id="board" style="display:none">
+        <thead>
+          <tr>
+            <th class="rank">#</th>
+            <th>Username</th>
+            <th class="points">Punti</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div id="empty" class="empty" style="display:none">
+        Nessun punto assegnato (ancora!). Appena arriva una sub o un gift, comparirà qui.
+      </div>
+    </div>
+
+    <footer id="foot"></footer>
+  </div>
+
+  <script>
+    async function loadLeaderboard() {
+      const statusEl = document.getElementById('status');
+      const tableEl  = document.getElementById('board');
+      const bodyEl   = document.getElementById('tbody');
+      const emptyEl  = document.getElementById('empty');
+      const footEl   = document.getElementById('foot');
+
+      statusEl.textContent = 'Caricamento classifica…';
+      tableEl.style.display = 'none';
+      emptyEl.style.display = 'none';
+      bodyEl.innerHTML = '';
+
+      try {
+        const res = await fetch('/leaderboard', { cache: 'no-store' });
+        if (!res.ok) throw new Error('Errore server: ' + res.status);
+        const data = await res.json();
+
+        if (!Array.isArray(data) || data.length === 0) {
+          statusEl.textContent = 'Nessun dato disponibile.';
+          emptyEl.style.display = 'block';
+          footEl.textContent = '';
+          return;
+        }
+
+        // Render righe
+        data.forEach((u, i) => {
+          const tr = document.createElement('tr');
+
+          const tdRank = document.createElement('td');
+          tdRank.className = 'rank';
+          if (i === 0 || i === 1 || i === 2) {
+            const span = document.createElement('span');
+            span.className = 'medal ' + (i===0 ? 'gold' : i===1 ? 'silver' : 'bronze');
+            span.textContent = i+1;
+            tdRank.appendChild(span);
+          } else {
+            tdRank.textContent = i + 1;
+          }
+
+          const tdUser = document.createElement('td');
+          tdUser.textContent = u.username ?? '(sconosciuto)';
+
+          const tdPts = document.createElement('td');
+          tdPts.className = 'points';
+          tdPts.textContent = Number(u.points || 0);
+
+          tr.appendChild(tdRank);
+          tr.appendChild(tdUser);
+          tr.appendChild(tdPts);
+          bodyEl.appendChild(tr);
+        });
+
+        statusEl.textContent = `Totale utenti: ${data.length}`;
+        tableEl.style.display = 'table';
+        footEl.textContent = 'Aggiorna per ricaricare • auto-refresh ogni 15s';
+      } catch (err) {
+        statusEl.textContent = 'Errore nel caricamento: ' + err.message;
+        emptyEl.style.display = 'block';
+      }
+    }
+
+    // Carica subito e auto-refresh ogni 15 secondi
+    loadLeaderboard();
+    setInterval(loadLeaderboard, 15000);
+  </script>
+</body>
+</html>
