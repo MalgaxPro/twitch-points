@@ -10,10 +10,10 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Se sei dietro proxy (Render/Ngrok), puoi abilitare:
+// Se hai un proxy davanti (Render/Ngrok), puoi abilitare:
 // app.set('trust proxy', 1);
 
-// --- DB: crea tabella se non esiste ---
+// ========== DB ==========
 const db = new sqlite3.Database(process.env.DB_PATH || './db.sqlite');
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS users (
@@ -24,7 +24,7 @@ db.serialize(() => {
   )`);
 });
 
-// --- Sessioni & Passport ---
+// ========== Sessioni & Passport ==========
 app.use(session({
   secret: process.env.SESSION_SECRET || 'supersecret',
   resave: false,
@@ -34,7 +34,7 @@ app.use(session({
 app.use(passport.initialize());
 app.use(passport.session());
 
-// --- Strategia Twitch (OAuth) ---
+// ========== OAuth Twitch ==========
 passport.use(new TwitchStrategy(
   {
     clientID: process.env.TWITCH_CLIENT_ID,
@@ -55,24 +55,23 @@ passport.use(new TwitchStrategy(
     );
   }
 ));
-
 passport.serializeUser((user, done) => done(null, user.twitch_id));
 passport.deserializeUser((id, done) => {
   db.get(`SELECT * FROM users WHERE twitch_id = ?`, [id], (err, row) => done(err, row));
 });
 
-// === RAW body su /eventsub (per HMAC corretto) ===
-app.use('/eventsub', express.raw({ type: 'application/json' }));
-
-// Per il resto dell’app (JSON normale + static)
+// ========== Body parsers ==========
+app.use('/eventsub', express.raw({ type: 'application/json' })); // RAW solo per EventSub (firma HMAC)
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// ========== Static ==========
 app.use(express.static(path.join(__dirname, 'public')));
 
-// --- Rotte OAuth ---
-// Salva se il login è partito in popup, così lo riprendiamo al callback
+// ========== Rotte OAuth ==========
 app.get('/auth/twitch',
   (req, res, next) => {
+    // conserva l'informazione se il login è partito da un popup
     if (req.query.popup === '1') req.session.oauthPopup = '1';
     next();
   },
@@ -88,32 +87,76 @@ app.get('/auth/twitch/callback',
   }
 );
 
-// --- Logout (supporta popup=1 per chiudere) ---
+// ========== Logout “crash-proof” (chiude popup SEMPRE) ==========
 app.get('/logout', (req, res) => {
   const isPopup = req.query.popup === '1';
-  req.logout?.();
-  req.session.destroy(() => {
-    if (isPopup) {
-      res.type('html').send(`
-<!DOCTYPE html><html><body style="background:#0f0f14;color:#f4f4f7;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh">
+
+  const sendPopupClose = () => {
+    // Risposta HTML che invia postMessage e chiude la finestra SEMPRE, anche se ci sono errori lato server
+    res.status(200).type('html').send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Logout</title></head>
+<body style="background:#0f0f14;color:#f4f4f7;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh">
   <div>Logout effettuato. Puoi chiudere questa finestra.</div>
   <script>
-    try {
-      if (window.opener) {
-        window.opener.postMessage({ type: 'logout' }, 'https://www.malgax.com');
-        window.opener.postMessage({ type: 'logout' }, 'https://malgax.com');
-      }
-    } catch(e){}
-    setTimeout(function(){ try{ window.close(); }catch(e){} }, 0);
+    (function(){
+      try {
+        if (window.opener) {
+          window.opener.postMessage({ type: 'logout' }, 'https://www.malgax.com');
+          window.opener.postMessage({ type: 'logout' }, 'https://malgax.com');
+        }
+        if (window.parent && window.parent !== window) {
+          window.parent.postMessage({ type: 'logout' }, 'https://www.malgax.com');
+          window.parent.postMessage({ type: 'logout' }, 'https://malgax.com');
+        }
+      } catch (e) {}
+      // tenta di chiudere subito
+      try { window.close(); } catch(e) {}
+      // fallback: svuota la pagina, così non si vede l'errore del server
+      setTimeout(function(){
+        try { document.body.innerHTML = '<div style="color:#9aa0a6">Logout completato. Puoi chiudere questa finestra.</div>'; } catch(e){}
+      }, 0);
+    })();
   </script>
 </body></html>`);
-    } else {
-      res.redirect('/');
+  };
+
+  const finish = () => {
+    if (isPopup) return sendPopupClose();
+    // non popup: torna alla home
+    return res.redirect('/');
+  };
+
+  // logout compatibile con Passport 0.6+ e versioni precedenti
+  const doLogout = (cb) => {
+    try {
+      if (typeof req.logout === 'function') {
+        if (req.logout.length > 0) {
+          // Passport >= 0.6 richiede callback
+          return req.logout(() => cb());
+        } else {
+          // Passport < 0.6
+          req.logout();
+          return cb();
+        }
+      }
+      return cb();
+    } catch (e) {
+      // ignora errori di logout e continua
+      return cb();
     }
-  });
+  };
+
+  const destroySession = (cb) => {
+    try {
+      if (req.session) return req.session.destroy(() => cb());
+    } catch (e) { /* ignore */ }
+    cb();
+  };
+
+  doLogout(() => destroySession(finish));
 });
 
-// --- API ---
+// ========== API ==========
 app.get('/me', (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'Non autenticato' });
   res.json(req.user);
@@ -126,7 +169,7 @@ app.get('/leaderboard', (req, res) => {
   });
 });
 
-// --- EventSub webhook ---
+// ========== EventSub ==========
 app.post('/eventsub', (req, res) => {
   const secret = process.env.TWITCH_EVENTSUB_SECRET || '';
   const msgId = req.get('Twitch-Eventsub-Message-Id') || '';
@@ -179,8 +222,10 @@ app.post('/eventsub', (req, res) => {
   return res.sendStatus(200);
 });
 
-// --- Health & Avvio ---
+// ========== Health ==========
 app.get('/health', (req, res) => res.send('OK'));
+
+// ========== Start ==========
 app.listen(PORT, () => {
   console.log(`Server avviato su http://localhost:${PORT}`);
 });
