@@ -1,46 +1,136 @@
 <!DOCTYPE html>
 <html lang="it">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Malgax Points – Profilo</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Malgax — Login & Classifica</title>
+  <meta name="description" content="Accedi con Twitch e guarda la classifica punti delle sub sul canale di Malgax." />
   <style>
+    :root { --twitch:#6441a5; --bg:#0f0f14; --card:#16161f; --text:#f4f4f7; --muted:#a4a4b5; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
     body {
-      font-family: Arial, sans-serif;
-      background: #f9f9f9;
-      text-align: center;
-      padding-top: 50px;
+      margin: 0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background: radial-gradient(1200px 800px at 10% -10%, #1d1540 0%, #0f0f14 50%) no-repeat, var(--bg);
+      color: var(--text);
+      display:flex; min-height:100vh;
     }
+    /* Colonna a destra centrata verticalmente */
+    .shell {
+      width:100%; display:flex; justify-content:flex-end; align-items:center; padding:24px;
+    }
+    .column {
+      width: min(560px, 100%); display:flex; flex-direction:column; gap:16px;
+      align-items:stretch;
+    }
+    /* Barra top destra con due pulsanti */
+    .topbar {
+      display:flex; justify-content:flex-end; gap:10px; position:relative; z-index:3;
+    }
+    .btn {
+      appearance:none; border:none; cursor:pointer; text-decoration:none; user-select:none;
+      padding:10px 14px; border-radius:10px; font-weight:700; transition:transform .05s ease;
+      display:inline-block; line-height:1;
+    }
+    .btn:active { transform: translateY(1px); }
+    .btn-primary { background:var(--twitch); color:#fff; }
+    .btn-outline { background:transparent; color:var(--twitch); border:1px solid var(--twitch); }
+    /* Card e iframe classifica */
     .card {
-      display: inline-block;
-      background: white;
-      padding: 30px;
-      border-radius: 10px;
-      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+      background: var(--card); border: 1px solid rgba(255,255,255,.06);
+      border-radius: 16px; box-shadow: 0 6px 24px rgba(0,0,0,.25);
+      overflow:hidden;
     }
+    .panel { padding: 18px; }
+    .muted { color: var(--muted); font-size:14px; line-height:1.55; }
+    .title { font-size:20px; margin:0 0 10px; }
+    .frame { width:100%; height:65vh; border:0; background:#0c0c12; display:block; }
+    @media (max-width: 720px) { .frame { height: 60vh; } }
+    /* Modal overlay durante apertura popup */
+    .modal-mask { display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9998; }
+    .modal { position:fixed; inset:0; display:none; align-items:center; justify-content:center; z-index:9999; }
+    .modal .box {
+      width:min(420px, 92%); background:#11131a; border:1px solid rgba(255,255,255,.06); border-radius:14px;
+      padding:18px; color:#fff; text-align:center;
+    }
+    .modal .hint { color:var(--muted); font-size:13px; margin-top:8px; }
   </style>
 </head>
 <body>
-  <h1>Profilo Utente</h1>
-  <div class="card">
-    <p><strong>Username:</strong> <span id="username"></span></p>
-    <p><strong>Punti:</strong> <span id="points"></span></p>
+  <div class="shell">
+    <div class="column">
+
+      <!-- Top-right: due tasti (a sinistra: Login/Logout) (a destra: Username/Accedi) -->
+      <div class="topbar">
+        <button id="btnAuth" class="btn btn-primary" type="button">Accedi</button>
+        <a id="btnUser" class="btn btn-outline" href="https://api.malgax.com/auth/twitch" rel="noopener">Accedi</a>
+      </div>
+
+      <!-- Card classifica -->
+      <section class="card panel">
+        <h2 class="title">Classifica Punti</h2>
+        <p class="muted" style="margin:0 0 12px">
+          Ogni <strong>sub</strong> vale <strong>+1 punto</strong>, ogni <strong>gift</strong> vale <strong>+N punti</strong> al gifter.
+        </p>
+        <iframe
+          class="frame"
+          src="https://api.malgax.com/leaderboard.html"
+          title="Classifica punti Malgax"
+          loading="lazy"
+          referrerpolicy="no-referrer"
+        ></iframe>
+      </section>
+
+    </div>
   </div>
-  <p><a href="/leaderboard.html">Vai alla Classifica</a></p>
+
+  <!-- Modal (overlay) mentre si apre il popup -->
+  <div id="mask" class="modal-mask"></div>
+  <div id="modal" class="modal" aria-hidden="true" aria-modal="true" role="dialog">
+    <div class="box">
+      <div style="font-weight:700; margin-bottom:6px;">Accedi con Twitch</div>
+      <div class="muted">Si sta aprendo una finestra per l’accesso…<br/>Se il popup è bloccato, <a id="loginLink" href="https://api.malgax.com/auth/twitch" style="color:#9cb3ff">clicca qui</a>.</div>
+      <div class="hint">Al termine, questa finestra si chiuderà automaticamente.</div>
+    </div>
+  </div>
 
   <script>
-    fetch('/me')
-      .then(res => {
-        if (!res.ok) throw new Error('Non autenticato');
-        return res.json();
-      })
-      .then(user => {
-        document.getElementById('username').textContent = user.username;
-        document.getElementById('points').textContent = user.points;
-      })
-      .catch(err => {
-        document.body.innerHTML = '<h2>Devi effettuare il login per vedere il profilo.</h2>';
-      });
-  </script>
-</body>
-</html>
+    /* ================= Config ================= */
+    const API_ORIGIN = "https://api.malgax.com";
+    const LOGIN_URL  = API_ORIGIN + "/auth/twitch?popup=1";
+    const LOGOUT_URL = API_ORIGIN + "/logout?popup=1";
+
+    /* ================= UI refs ================= */
+    const btnAuth = document.getElementById('btnAuth');
+    const btnUser = document.getElementById('btnUser');
+    const mask    = document.getElementById('mask');
+    const modal   = document.getElementById('modal');
+    const loginLink = document.getElementById('loginLink');
+
+    /* ================= Stato login ================= */
+    let loggedIn = false;
+    let username = null;
+    let authWin  = null;
+    let monitor  = null;
+
+    function setUI() {
+      if (loggedIn) {
+        btnAuth.textContent = 'Logout';
+        btnUser.textContent = username || 'Profilo';
+        btnUser.href = API_ORIGIN + '/profile.html';
+      } else {
+        btnAuth.textContent = 'Accedi';
+        btnUser.textContent = 'Accedi';
+        btnUser.href = API_ORIGIN + '/auth/twitch';
+      }
+    }
+    setUI();
+
+    /* ================= Popup helpers ================= */
+    function centerSpecs(w, h) {
+      const dualScreenLeft = window.screenLeft ?? screen.left;
+      const dualScreenTop  = window.screenTop  ?? screen.top;
+      const width  = window.innerWidth  || document.documentElement.clientWidth  || screen.width;
+      const height = window.innerHeight || document.documentElement.clientHeight || screen.height;
+      const left = dualScreenLeft + Math.max(0, (width - w) / 2);
+      const top  = dualScreenTop  + Math.max(0, (heig

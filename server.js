@@ -10,8 +10,11 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Se sei dietro proxy (Render/Ngrok), puoi abilitare:
+// app.set('trust proxy', 1);
+
 // --- DB: crea tabella se non esiste ---
-const db = new sqlite3.Database('./db.sqlite');
+const db = new sqlite3.Database(process.env.DB_PATH || './db.sqlite');
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25,7 +28,8 @@ db.serialize(() => {
 app.use(session({
   secret: process.env.SESSION_SECRET || 'supersecret',
   resave: false,
-  saveUninitialized: false
+  saveUninitialized: false,
+  // cookie: { secure: true, sameSite: 'lax' } // usa secure:true solo con HTTPS end-to-end
 }));
 app.use(passport.initialize());
 app.use(passport.session());
@@ -39,7 +43,6 @@ passport.use(new TwitchStrategy(
     scope: 'user:read:email channel:read:subscriptions'
   },
   (accessToken, refreshToken, profile, done) => {
-    // crea utente se non esiste, altrimenti restituiscilo
     db.run(
       `INSERT OR IGNORE INTO users (twitch_id, username, points) VALUES (?, ?, 0)`,
       [profile.id, profile.display_name],
@@ -58,7 +61,7 @@ passport.deserializeUser((id, done) => {
   db.get(`SELECT * FROM users WHERE twitch_id = ?`, [id], (err, row) => done(err, row));
 });
 
-// === IMPORTANTISSIMO per EventSub: leggere RAW body su /eventsub ===
+// === RAW body su /eventsub (per HMAC corretto) ===
 app.use('/eventsub', express.raw({ type: 'application/json' }));
 
 // Per il resto dell’app (JSON normale + static)
@@ -67,12 +70,48 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // --- Rotte OAuth ---
-app.get('/auth/twitch', passport.authenticate('twitch'));
+// Salva se il login è partito in popup, così lo riprendiamo al callback
+app.get('/auth/twitch',
+  (req, res, next) => {
+    if (req.query.popup === '1') req.session.oauthPopup = '1';
+    next();
+  },
+  passport.authenticate('twitch')
+);
 
 app.get('/auth/twitch/callback',
   passport.authenticate('twitch', { failureRedirect: '/' }),
-  (req, res) => res.redirect('/profile.html')
+  (req, res) => {
+    const isPopup = req.session.oauthPopup === '1' || req.query.popup === '1';
+    delete req.session.oauthPopup;
+    res.redirect(isPopup ? '/profile.html?popup=1' : '/profile.html');
+  }
 );
+
+// --- Logout (supporta popup=1 per chiudere) ---
+app.get('/logout', (req, res) => {
+  const isPopup = req.query.popup === '1';
+  req.logout?.();
+  req.session.destroy(() => {
+    if (isPopup) {
+      res.type('html').send(`
+<!DOCTYPE html><html><body style="background:#0f0f14;color:#f4f4f7;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh">
+  <div>Logout effettuato. Puoi chiudere questa finestra.</div>
+  <script>
+    try {
+      if (window.opener) {
+        window.opener.postMessage({ type: 'logout' }, 'https://www.malgax.com');
+        window.opener.postMessage({ type: 'logout' }, 'https://malgax.com');
+      }
+    } catch(e){}
+    setTimeout(function(){ try{ window.close(); }catch(e){} }, 0);
+  </script>
+</body></html>`);
+    } else {
+      res.redirect('/');
+    }
+  });
+});
 
 // --- API ---
 app.get('/me', (req, res) => {
@@ -94,19 +133,16 @@ app.post('/eventsub', (req, res) => {
   const timestamp = req.get('Twitch-Eventsub-Message-Timestamp') || '';
   const signature = (req.get('Twitch-Eventsub-Message-Signature') || '').toLowerCase();
 
-  // req.body è un Buffer (grazie a express.raw su /eventsub)
-  // Calcolo HMAC in modo binary-safe: msgId || timestamp || rawBody
   const hmac = crypto.createHmac('sha256', secret);
   hmac.update(msgId);
   hmac.update(timestamp);
-  hmac.update(req.body);
+  hmac.update(req.body); // Buffer RAW
   const expected = 'sha256=' + hmac.digest('hex');
 
   if (expected !== signature) {
     return res.status(403).type('text/plain').send('Invalid signature');
   }
 
-  // Challenge di verifica (risposta in text/plain)
   let payload;
   try {
     payload = JSON.parse(req.body.toString('utf8'));
@@ -143,7 +179,7 @@ app.post('/eventsub', (req, res) => {
   return res.sendStatus(200);
 });
 
-// --- Avvio ---
+// --- Health & Avvio ---
 app.get('/health', (req, res) => res.send('OK'));
 app.listen(PORT, () => {
   console.log(`Server avviato su http://localhost:${PORT}`);
