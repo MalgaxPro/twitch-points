@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>Punti non spesi — Malgax</title>
+  <style>
+    :root{ --bg:#0f0f14; --card:#16161f; --text:#f4f4f7; --muted:#a4a4b5; --line:#2a2a36; }
+    *{ box-sizing:border-box }
+    body{
+      margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background: var(--bg); color: var(--text);
+    }
+    .wrap{ padding:16px }
+    .card{ background: var(--card); border:1px solid rgba(255,255,255,.08); border-radius:12px; padding:14px }
+    h1{ font-size:18px; margin:0 0 10px }
+    p.muted{ color:var(--muted); margin:0 0 12px; font-size:14px }
+    table{ width:100%; border-collapse: collapse; }
+    th, td{ text-align:left; padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.06) }
+    th{ color:#cfd0ff; font-weight:700; font-size:13px; letter-spacing:.2px }
+    td{ font-size:14px }
+    .rank{ width:64px; color:#c9c9d9 }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Punti non spesi</h1>
+      <p class="muted">Per ora coincide con i punti totali (Top Donator). In futuro scalerenmo i punti usati per comprare carte.</p>
+      <table id="tbl">
+        <thead>
+          <tr>
+            <th class="rank">#</th>
+            <th>Utente</th>
+            <th>Punti non spesi</th>
+          </tr>
+        </thead>
+        <tbody id="body"><tr><td colspan="3" class="muted">Caricamento…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    async function load(){
+      try{
+        const res = await fetch('/leaderboard', { credentials:'include', cache:'no-store' });
+        const data = await res.json();
+        const body = document.getElementById('body');
+        body.innerHTML = '';
+        (data||[]).forEach((row, i)=>{
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td class="rank">${i+1}</td>
+            <td>${row.username || '(sconosciuto)'}</td>
+            <td>${Number(row.points||0)}</td>`;
+          body.appendChild(tr);
+        });
+        if(!data || data.length===0){
+          body.innerHTML = '<tr><td colspan="3" class="muted">Nessun dato disponibile.</td></tr>';
+        }
+      }catch(e){
+        const body = document.getElementById('body');
+        body.innerHTML = '<tr><td colspan="3" class="muted">Errore nel caricamento.</td></tr>';
+      }
+    }
+    load();
+  </script>
+</body>
+</html>
