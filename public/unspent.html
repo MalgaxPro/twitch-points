@@ -5,64 +5,146 @@
   <meta name="viewport" content="width=device-width,initial-scale=1.0" />
   <title>Punti non spesi — Malgax</title>
   <style>
-    :root{ --bg:#0f0f14; --card:#16161f; --text:#f4f4f7; --muted:#a4a4b5; --line:#2a2a36; }
+    :root{
+      --bg:#0f0f14; --card:#16161f; --text:#f4f4f7; --muted:#a4a4b5; --line:#2a2a36;
+      --accent:#6441a5; --border:rgba(255,255,255,.08); --borderSoft:rgba(255,255,255,.06);
+    }
     *{ box-sizing:border-box }
+    html,body{ height:100% }
     body{
       margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
-      background: var(--bg); color: var(--text);
+      background:var(--bg); color:var(--text);
     }
-    .wrap{ padding:16px }
-    .card{ background: var(--card); border:1px solid rgba(255,255,255,.08); border-radius:12px; padding:14px }
-    h1{ font-size:18px; margin:0 0 10px }
-    p.muted{ color:var(--muted); margin:0 0 12px; font-size:14px }
-    table{ width:100%; border-collapse: collapse; }
-    th, td{ text-align:left; padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.06) }
-    th{ color:#cfd0ff; font-weight:700; font-size:13px; letter-spacing:.2px }
-    td{ font-size:14px }
-    .rank{ width:64px; color:#c9c9d9 }
+    .wrap{
+      max-width:980px; margin:0 auto; padding:16px;
+    }
+    .card{
+      background:var(--card);
+      border:1px solid var(--border);
+      border-radius:16px;
+      box-shadow:0 6px 24px rgba(0,0,0,.25);
+      overflow:hidden;
+    }
+    .card-head{
+      display:flex; align-items:center; justify-content:space-between; gap:12px;
+      padding:16px 18px;
+      border-bottom:1px solid var(--borderSoft);
+      background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,0));
+    }
+    h1{
+      margin:0; font-size:20px; letter-spacing:.2px; display:flex; align-items:center; gap:8px;
+    }
+    .badge{
+      font-size:12px; color:#d9d9ff; background:rgba(100,65,165,.2);
+      border:1px solid rgba(255,255,255,.15); padding:6px 10px; border-radius:999px;
+    }
+    p.muted{ color:var(--muted); margin:0; font-size:14px }
+    .body{ padding:10px 14px 16px }
+
+    table{
+      width:100%; border-collapse:collapse; table-layout:auto;
+      border-radius:12px; overflow:hidden;
+    }
+    thead th{
+      position:sticky; top:0; z-index:1;
+      background:#14141c; color:#cfd0ff; font-weight:700; font-size:13px; letter-spacing:.2px;
+      text-align:left; padding:10px 10px; border-bottom:1px solid var(--borderSoft);
+    }
+    tbody td{
+      padding:10px 10px; border-bottom:1px solid var(--borderSoft);
+      font-size:14px; color:var(--text);
+    }
+    .rank{ width:70px; color:#c9c9d9 }
+    tbody tr:hover{ background:rgba(255,255,255,.02) }
+
+    /* Medaglie top 3 */
+    .medal{ font-size:16px }
+    .r1 .medal{ filter: drop-shadow(0 0 4px rgba(255,215,0,.35)); }
+    .r2 .medal{ filter: drop-shadow(0 0 4px rgba(180,180,180,.35)); }
+    .r3 .medal{ filter: drop-shadow(0 0 4px rgba(205,127,50,.35)); }
+
+    /* Stato di caricamento/errore */
+    .status{ color:var(--muted); text-align:center; padding:18px 8px; font-size:14px }
+
+    @media (max-width:560px){
+      .rank{ width:54px }
+      thead th, tbody td{ padding:9px 8px }
+      h1{ font-size:18px }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
-      <h1>Punti non spesi</h1>
-      <p class="muted">Per ora coincide con i punti totali (Top Donator). In futuro scalerenmo i punti usati per comprare carte.</p>
-      <table id="tbl">
-        <thead>
-          <tr>
-            <th class="rank">#</th>
-            <th>Utente</th>
-            <th>Punti non spesi</th>
-          </tr>
-        </thead>
-        <tbody id="body"><tr><td colspan="3" class="muted">Caricamento…</td></tr></tbody>
-      </table>
+      <div class="card-head">
+        <h1>📦 Punti non spesi</h1>
+        <span class="badge">identico stile Top Donator</span>
+      </div>
+
+      <div class="body">
+        <p class="muted" style="margin:0 0 12px">
+          Per ora coincide con i punti totali. In futuro verranno scalati i punti usati per comprare carte.
+        </p>
+
+        <table aria-label="Punti non spesi">
+          <thead>
+            <tr>
+              <th class="rank">#</th>
+              <th>Utente</th>
+              <th>Punti non spesi</th>
+            </tr>
+          </thead>
+          <tbody id="rows">
+            <tr><td colspan="3" class="status">Caricamento…</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 
   <script>
     async function load(){
+      const rows = document.getElementById('rows');
       try{
-        const res = await fetch('/leaderboard', { credentials:'include', cache:'no-store' });
+        // stessi dati della classifica top donator
+        const res = await fetch('/leaderboard?ts=' + Date.now(), { credentials:'include', cache:'no-store' });
+        if(!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
-        const body = document.getElementById('body');
-        body.innerHTML = '';
-        (data||[]).forEach((row, i)=>{
+
+        rows.innerHTML = '';
+        (data || []).forEach((u, i) => {
           const tr = document.createElement('tr');
+          if(i===0) tr.classList.add('r1');
+          if(i===1) tr.classList.add('r2');
+          if(i===2) tr.classList.add('r3');
+
+          const medal = i===0 ? '🥇' : i===1 ? '🥈' : i===2 ? '🥉' : '';
           tr.innerHTML = `
-            <td class="rank">${i+1}</td>
-            <td>${row.username || '(sconosciuto)'}</td>
-            <td>${Number(row.points||0)}</td>`;
-          body.appendChild(tr);
+            <td class="rank">${medal ? `<span class="medal">${medal}</span>` : i+1}</td>
+            <td>${escapeHtml(u.username || '(sconosciuto)')}</td>
+            <td>${Number(u.points || 0)}</td>
+          `;
+          rows.appendChild(tr);
         });
-        if(!data || data.length===0){
-          body.innerHTML = '<tr><td colspan="3" class="muted">Nessun dato disponibile.</td></tr>';
+
+        if(!data || data.length === 0){
+          rows.innerHTML = '<tr><td colspan="3" class="status">Nessun dato disponibile.</td></tr>';
         }
       }catch(e){
-        const body = document.getElementById('body');
-        body.innerHTML = '<tr><td colspan="3" class="muted">Errore nel caricamento.</td></tr>';
+        rows.innerHTML = '<tr><td colspan="3" class="status">Errore nel caricamento.</td></tr>';
       }
     }
+
+    // sanificazione minima per sicurezza
+    function escapeHtml(str){
+      return String(str)
+        .replaceAll('&','&amp;')
+        .replaceAll('<','&lt;')
+        .replaceAll('>','&gt;')
+        .replaceAll('"','&quot;')
+        .replaceAll("'",'&#39;');
+    }
+
     load();
   </script>
 </body>
