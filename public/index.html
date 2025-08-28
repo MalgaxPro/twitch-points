@@ -1,493 +1,753 @@
-// server.js
-require('dotenv').config();
-const express = require('express');
-const path = require('path');
-const crypto = require('crypto');
-const session = require('express-session');
-const cors = require('cors');
-const passport = require('passport');
-const TwitchStrategy = require('passport-twitch-new').Strategy;
-const { Pool } = require('pg');
-
-const {
-  PORT = 3000,
-  SESSION_SECRET = 'dev_secret_change_me',
-  TWITCH_CLIENT_ID,
-  TWITCH_CLIENT_SECRET,
-  TWITCH_CALLBACK_URL,       // es: https://api.malgax.com/auth/twitch/callback
-  TWITCH_EVENTSUB_SECRET,    // segreto per validare EventSub
-  DATABASE_URL               // stringa Neon
-} = process.env;
-
-if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET || !TWITCH_CALLBACK_URL) {
-  console.warn('[WARN] Twitch OAuth env non completi. Verifica .env su Render.');
-}
-if (!DATABASE_URL) {
-  console.warn('[WARN] DATABASE_URL mancante (Neon).');
-}
-if (!TWITCH_EVENTSUB_SECRET) {
-  console.warn('[WARN] TWITCH_EVENTSUB_SECRET mancante (EventSub).');
-}
-
-const app = express();
-app.set('trust proxy', 1);
-
-// CORS per il sito
-app.use(cors({
-  origin: ['https://www.malgax.com', 'https://malgax.com'],
-  credentials: true
-}));
-
-// Body parsers (NB: /eventsub usa raw json, configurato nella route)
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Sessione (cookie cross-site)
-app.use(session({
-  secret: SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    sameSite: 'none',
-    secure: true,
-    maxAge: 1000 * 60 * 60 * 24 * 30
-  }
-}));
-
-// DB (Neon Postgres)
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-
-// Passport
-passport.serializeUser((user, done) => {
-  done(null, { id: user.id, twitch_id: user.twitch_id, username: user.username });
-});
-passport.deserializeUser((obj, done) => done(null, obj));
-
-passport.use(new TwitchStrategy({
-  clientID: TWITCH_CLIENT_ID,
-  clientSecret: TWITCH_CLIENT_SECRET,
-  callbackURL: TWITCH_CALLBACK_URL,
-  scope: ['user:read:email', 'channel:read:subscriptions']
-}, async (accessToken, refreshToken, profile, done) => {
-  try {
-    const tid = String(profile.id);
-    const uname = profile.display_name || profile.username || profile.login || 'Utente';
-    const upsert = await pool.query(`
-      INSERT INTO users (twitch_id, username)
-      VALUES ($1, $2)
-      ON CONFLICT (twitch_id)
-      DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
-      RETURNING id, twitch_id, username, total_points, unspent_points
-    `, [tid, uname]);
-    const user = upsert.rows[0];
-    return done(null, user);
-  } catch (e) {
-    return done(e);
-  }
-}));
-
-app.use(passport.initialize());
-app.use(passport.session());
-
-// ========== DB: schema base + inventario/ledger ==========
-async function initDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      twitch_id TEXT UNIQUE NOT NULL,
-      username TEXT,
-      total_points INTEGER NOT NULL DEFAULT 0,
-      unspent_points INTEGER NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tid ON users(twitch_id);
-
-    CREATE TABLE IF NOT EXISTS items (
-      id SERIAL PRIMARY KEY,
-      slug TEXT UNIQUE NOT NULL,
-      name TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK (kind IN ('creature','spell','instant')),
-      cost_points INTEGER NOT NULL CHECK (cost_points > 0),
-      image_url TEXT NOT NULL,
-      description TEXT DEFAULT '',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS user_items (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-      quantity INTEGER NOT NULL CHECK (quantity >= 0),
-      UNIQUE(user_id, item_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS point_transactions (
-      id BIGSERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      type TEXT NOT NULL CHECK (type IN ('purchase','spend','grant','refund')),
-      delta_points INTEGER NOT NULL,
-      item_id INTEGER REFERENCES items(id),
-      quantity INTEGER,
-      client_token TEXT,
-      points_before INTEGER NOT NULL,
-      points_after  INTEGER NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_user_items_user ON user_items(user_id);
-    CREATE INDEX IF NOT EXISTS idx_tx_user_created ON point_transactions(user_id, created_at DESC);
-  `);
-}
-initDb().catch(err => {
-  console.error('DB init error:', err);
-  process.exit(1);
-});
-
-// Utils
-function requireAuth(req, res, next) {
-  if (req.isAuthenticated && req.isAuthenticated()) return next();
-  return res.status(401).json({ error: 'unauthorized' });
-}
-
-async function grantPointsByTwitchId(client, twitch_id, username, delta) {
-  const uRes = await client.query(`
-    INSERT INTO users (twitch_id, username)
-    VALUES ($1, $2)
-    ON CONFLICT (twitch_id)
-    DO UPDATE SET username = COALESCE(EXCLUDED.username, users.username), updated_at=NOW()
-    RETURNING id, total_points, unspent_points
-  `, [twitch_id, username || null]);
-  const u = uRes.rows[0];
-
-  const before = u.unspent_points;
-  const after  = u.unspent_points + delta;
-
-  await client.query(
-    'UPDATE users SET total_points = total_points + $1, unspent_points = unspent_points + $1, updated_at=NOW() WHERE id=$2',
-    [delta, u.id]
-  );
-
-  await client.query(`
-    INSERT INTO point_transactions (user_id, type, delta_points, points_before, points_after)
-    VALUES ($1, 'grant', $2, $3, $4)
-  `, [u.id, delta, before, after]);
-}
-
-// ========== OAuth ==========
-// Salva in sessione se è un popup (non ci fidiamo dello "state" di ritorno)
-app.get('/auth/twitch', (req, res, next) => {
-  const isPopup = req.query.popup === '1';
-  req.session.isPopup = isPopup;
-  // manteniamo anche uno state informativo, ma il flag di sessione è la fonte di verità
-  const state = isPopup ? 'popup' : 'redir';
-  passport.authenticate('twitch', { state })(req, res, next);
-});
-
-// callback “a prova di tutto”: usa il flag di sessione per capire il flusso popup
-app.get('/auth/twitch/callback',
-  passport.authenticate('twitch', { failureRedirect: '/auth-failed.html' }),
-  async (req, res) => {
-    const isPopup = !!req.session.isPopup || req.query.state === 'popup' || req.query.popup === '1';
-    // una volta letto, azzera per sicurezza
-    req.session.isPopup = undefined;
-
-    if (isPopup) {
-      res.type('html').send(`
-        <!doctype html><meta charset="utf-8"><title>Login OK</title>
-        <script>
-          (function(){
-            function notify(){
-              try{ if(window.opener) window.opener.postMessage({type:'login'}, '*'); }catch(e){}
-              try{ if(window.parent && window.parent!==window) window.parent.postMessage({type:'login'}, '*'); }catch(e){}
-            }
-            notify();
-
-            let attempts = 0;
-            function tryClose(){
-              attempts++;
-              try { window.close(); } catch(e) {}
-              if (window.closed) return;
-              if (attempts < 10) {
-                setTimeout(tryClose, attempts < 4 ? 100 : 250);
-              } else {
-                document.body.style = 'margin:0;background:#0f0f14;color:#fff;font:14px system-ui,Segoe UI,Roboto,Arial';
-                document.body.innerHTML = '<div style="padding:20px">Login completato. Questa finestra può essere chiusa.<br><br><button id="b" style="padding:10px 14px;border-radius:10px;border:1px solid #444;background:#6441a5;color:#fff;font-weight:800;cursor:pointer">Chiudi</button></div>';
-                document.getElementById('b').onclick = function(){
-                  notify();
-                  try { window.open("","_self"); } catch(e){}
-                  try { window.close(); } catch(e){}
-                };
-                // ulteriori tentativi automatici
-                setTimeout(function(){ notify(); try { window.close(); } catch(e){} }, 600);
-                setTimeout(function(){ notify(); try { window.close(); } catch(e){} }, 1200);
-              }
-            }
-            setTimeout(tryClose, 80);
-          })();
-        </script>
-        <noscript>Login completato. Puoi chiudere questa finestra.</noscript>
-      `);
-    } else {
-      res.redirect('/profile.html');
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Malgax — No Udyr challeng</title>
+  <meta name="description" content="No Udyr challeng — Accedi con Twitch e guarda la classifica punti delle sub sul canale di Malgax." />
+  <style>
+    :root{
+      --twitch:#6441a5; --bg:#0f0f14; --card:#16161f; --text:#f4f4f7; --muted:#a4a4b5; --line:#2a2a36;
+      --cols-desktop: 5; --cols-tablet: 4; --cols-mobile: 2;
+      --gap: 8px; --ratio-w: 2; --ratio-h: 3;
     }
-  }
-);
+    *{box-sizing:border-box}
+    html,body{min-height:100%}
+    body{
+      margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background: radial-gradient(1200px 800px at 10% -10%, #1d1540 0%, #0f0f14 50%) no-repeat, var(--bg);
+      color:var(--text);
+      overflow-x:hidden;
+    }
 
-app.get('/logout', (req, res, next) => {
-  const isPopup = req.query.popup === '1' || req.session.isPopup === true;
-  req.session.isPopup = undefined;
-  req.logout(err => {
-    if (err) return next(err);
-    req.session.destroy(() => {
-      if (isPopup) {
-        res.type('html').send(`
-          <!doctype html><meta charset="utf-8"><title>Logout</title>
-          <script>
-            try{ if(window.opener) window.opener.postMessage({type:'logout'}, '*'); }catch(e){}
-            try{ if(window.parent && window.parent!==window) window.parent.postMessage({type:'logout'}, '*'); }catch(e){}
-            try { window.close(); } catch(e){}
-            setTimeout(function(){ try{ window.close(); }catch(e){} }, 250);
-            setTimeout(function(){
-              document.body.style='margin:0;background:#0f0f14;color:#fff;font:14px system-ui,Segoe UI,Roboto,Arial';
-              document.body.innerHTML='Logout eseguito. Puoi chiudere questa finestra.';
-            }, 800);
-          </script>
-          <noscript>Logout eseguito. Puoi chiudere questa finestra.</noscript>
-        `);
-      } else {
-        res.redirect('/profile.html');
+    /* ===== Hero / Intestazione ===== */
+    .hero{
+      width:100%;
+      background:
+        radial-gradient(800px 300px at 50% 0%, rgba(100,65,165,.25), rgba(0,0,0,0) 70%),
+        linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.0));
+      border-bottom:1px solid rgba(255,255,255,.08);
+      padding:26px 24px 18px;
+    }
+    .hero-inner{
+      max-width:1600px; margin:0 auto; padding:0 24px;
+      display:flex; align-items:center; justify-content:space-between; gap:16px;
+    }
+    .hero-title{
+      margin:0; font-size: clamp(22px, 3vw, 34px); letter-spacing:.3px; font-weight:800;
+      display:flex; align-items:center; gap:10px;
+      text-shadow: 0 2px 20px rgba(100,65,165,.35);
+    }
+    .btn{
+      appearance:none; border:0; cursor:pointer; user-select:none;
+      padding:10px 14px; border-radius:10px; font-weight:700; background:var(--twitch); color:#fff;
+    }
+    .hero-login{ padding:8px 12px; }
+
+    /* --- Header actions (pill + button) --- */
+    .hero-actions{ display:flex; align-items:center; gap:10px; }
+    .user-pill{
+      display:flex; align-items:center; gap:8px;
+      background:rgba(255,255,255,.06);
+      border:1px solid rgba(255,255,255,.12);
+      padding:6px 10px; border-radius:999px;
+      font-weight:700; color:#e9e9ff;
+    }
+    .user-name{ max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .coin-icon{
+      width:14px; height:14px; border-radius:50%;
+      display:inline-block;
+      background:
+        radial-gradient(90% 90% at 30% 30%, #fff4a6 0%, #ffd94d 35%, #e0a300 60%, #b07b00 100%);
+      box-shadow:
+        inset 0 0 0 1px rgba(0,0,0,.25),
+        0 1px 4px rgba(0,0,0,.35);
+    }
+    .user-unspent{ font-variant-numeric: tabular-nums; }
+
+    /* ===== Layout 60% / 40% ===== */
+    .page{
+      width:100%; max-width:1600px;
+      margin:18px auto;
+      padding:0 24px;
+      display:grid; grid-template-columns: 60% 40%; gap:24px; align-items:start;
+    }
+    @media (max-width:1100px){ .page{ grid-template-columns:1fr } }
+
+    /* ===== Colonna destra (leaderboard + regole) ===== */
+    .column{ display:flex; flex-direction:column; gap:16px }
+    .card{ background:var(--card); border:1px solid rgba(255,255,255,.06); border-radius:16px; box-shadow:0 6px 24px rgba(0,0,0,.25); overflow:hidden }
+    .panel{ padding:18px }
+    .muted{ color:var(--muted); font-size:14px; line-height:1.55 }
+    .title{ font-size:20px; margin:0 }
+    .frame{ width:100%; height:65vh; border:0; background:#0c0c12; display:block }
+    @media (max-width:720px){ .frame{ height:60vh } }
+
+    /* ===== Tabs (Generiche) ===== */
+    .tabs{ display:flex; gap:10px; padding:10px; background:#14141c; border-bottom:1px solid rgba(255,255,255,.06); }
+    .tab{
+      padding:8px 12px; border-radius:10px; font-weight:700; font-size:14px;
+      background:rgba(255,255,255,.06); color:#eaeaf0; border:1px solid rgba(255,255,255,.10);
+      cursor:pointer;
+    }
+    .tab.is-active{
+      background:rgba(100,65,165,.25);
+      border-color: rgba(100,65,165,.55);
+      box-shadow:0 0 0 3px rgba(100,65,165,.15) inset;
+    }
+
+    /* ===== Sezione Regole ===== */
+    .rules{ padding:16px 18px 20px; font-size:15px; line-height:1.6; color:#e9e9fa; }
+    .rules ul{ margin:10px 0 0 0; padding-left:18px }
+    .rules li{ margin:8px 0 }
+    .rules .chip{
+      display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px;
+      background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.10); font-size:13px; color:#dfe0ff;
+    }
+
+    /* ===== Colonna sinistra (categorie carte) ===== */
+    .left-card{
+      background:linear-gradient(135deg, rgba(100,65,165,.18), rgba(255,255,255,.02));
+      border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:18px; box-shadow:0 10px 28px rgba(0,0,0,.35)
+    }
+    .cat{ margin-bottom:18px; background:rgba(0,0,0,.18); border:1px solid rgba(255,255,255,.06); border-radius:12px; padding:14px }
+    .cat-head{ display:flex; align-items:center; gap:10px; margin-bottom:12px }
+    .cat-title{ margin:0; font-size:16px; color:#eaeaf0; display:flex; align-items:center; gap:10px; }
+    .cat-emoji{ font-size:18px }
+    .cat-line{ height:1px; background:var(--line); flex:1; border-radius:1px; box-shadow:inset 0 0 0 1px rgba(255,255,255,.02) }
+
+    .cards-row{
+      display:grid; gap: var(--gap);
+      grid-template-columns: repeat(var(--cols-desktop), 1fr);
+    }
+    @media (max-width:980px){ .cards-row{ grid-template-columns: repeat(var(--cols-tablet), 1fr) } }
+    @media (max-width:620px){ .cards-row{ grid-template-columns: repeat(var(--cols-mobile), 1fr) } }
+
+    .card-item{
+      position:relative;
+      aspect-ratio: calc(var(--ratio-w) / var(--ratio-h)); /* 2:3 */
+      background:#0c0c12; border:1px solid rgba(255,255,255,.12); border-radius:12px;
+      overflow:hidden; display:flex; align-items:center; justify-content:center; padding:0;
+      min-height: 180px;
+      transition: transform .2s ease;
+    }
+    .card-item:hover{ transform: translateY(-2px) }
+    .card-item img{ width:100%; height:100%; object-fit:contain; display:block; image-rendering:auto; }
+
+    /* iFrame di probing nascosto */
+    .probe{ position:absolute; width:1px; height:1px; opacity:0; pointer-events:none }
+
+    /* Overlay popup login */
+    .modal-mask{display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9998}
+    .modal{position:fixed; inset:0; display:none; align-items:center; justify-content:center; z-index:9999}
+    .modal .box{ width:min(420px, 92%); background:#11131a; border:1px solid rgba(255,255,255,.06); border-radius:14px; padding:18px; color:#fff; text-align:center }
+    .modal .hint{ color:#a4a4b5; font-size:13px; margin-top:8px }
+
+    /* ======== VIEWER FULLSCREEN con 3D tilt ======== */
+    .viewer-mask{
+      position:fixed; inset:0; background:rgba(0,0,0,.85);
+      display:none; align-items:center; justify-content:center;
+      z-index: 10000;
+      backdrop-filter: blur(2px);
+    }
+    .viewer{
+      width: clamp(220px, 30.666vw, 300px);
+      aspect-ratio: calc(var(--ratio-w) / var(--ratio-h)); /* 2:3 */
+      perspective: 1400px;
+      position:relative;
+      touch-action: none;
+    }
+    .viewer-inner{
+      position:absolute; inset:0;
+      border-radius:16px; overflow:hidden;
+      background:#0b0b10;
+      border:1px solid rgba(255,255,255,.08);
+      box-shadow: 0 30px 80px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.05) inset;
+      transform-style: preserve-3d;
+      will-change: transform;
+      transition: transform .18s ease, box-shadow .2s ease;
+    }
+    .viewer-img{
+      position:absolute; inset:0;
+      width:100%; height:100%; object-fit:contain; pointer-events:none;
+      transform: translateZ(20px);
+    }
+    .viewer-shine{
+      position:absolute; inset:-30%;
+      background: radial-gradient(800px 500px at var(--sx,50%) var(--sy,50%), rgba(255,255,255,.22), rgba(255,255,255,0) 60%);
+      mix-blend-mode: screen; pointer-events:none;
+      transform: translateZ(40px);
+      opacity:.65;
+    }
+    .viewer-actions{
+      position:absolute; top:-46px; right:0; display:flex; gap:8px;
+    }
+    .viewer-btn{
+      background:rgba(20,20,28,.85); border:1px solid rgba(255,255,255,.18); color:#fff;
+      padding:8px 12px; border-radius:10px; cursor:pointer; font-weight:700;
+      box-shadow:0 6px 20px rgba(0,0,0,.4);
+    }
+    @media (max-width:720px){ .viewer-actions{ top:-52px } }
+    @media (prefers-reduced-motion: reduce){ .viewer-inner{ transition: none } }
+
+    /* ==== INVENTORY DRAWER (slide-in) ==== */
+    .inv-toggle{
+      position:fixed; right:0; top:50%; transform:translateY(-50%);
+      writing-mode:vertical-rl; text-orientation:mixed;
+      background:#6441a5; color:#fff; border:0; border-radius:10px 0 0 10px;
+      padding:12px 10px; font-weight:800; letter-spacing:.5px; cursor:pointer;
+      box-shadow:0 6px 18px rgba(0,0,0,.35); z-index:11000;
+    }
+    .inv-mask{
+      position:fixed; inset:0; background:rgba(0,0,0,.5);
+      display:none; z-index:10990;
+    }
+    .inv-drawer{
+      position:fixed; right:-420px; top:0; height:100vh; width:380px; max-width:88vw;
+      background:#11131a; border-left:1px solid rgba(255,255,255,.12);
+      box-shadow:-12px 0 28px rgba(0,0,0,.45);
+      z-index:11010; display:flex; flex-direction:column; transition:right .25s ease;
+    }
+    .inv-drawer.open{ right:0; }
+    .inv-head{
+      display:flex; align-items:center; justify-content:space-between;
+      padding:14px; background:#14141c; border-bottom:1px solid rgba(255,255,255,.08);
+    }
+    .inv-title{ margin:0; font-size:16px; }
+    .inv-close{
+      background:transparent; color:#fff; border:1px solid rgba(255,255,255,.2);
+      border-radius:8px; padding:6px 10px; cursor:pointer;
+    }
+    .inv-body{ padding:12px; overflow:auto; }
+    .inv-grid{ display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+    .inv-card{ background:#16161f; border:1px solid rgba(255,255,255,.08); border-radius:10px; overflow:hidden; }
+    .inv-thumb{ aspect-ratio:2/3; background:#0b0b10; display:flex; align-items:center; justify-content:center; }
+    .inv-thumb img{ width:100%; height:100%; object-fit:contain; }
+    .inv-info{ padding:8px 10px; font-size:13px; color:#dcdcf0; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    .inv-q{ color:#a4a4b5; font-variant-numeric:tabular-nums; }
+    .inv-empty{ color:#a4a4b5; text-align:center; padding:16px 8px; }
+    @media (max-width:620px){
+      .inv-grid{ grid-template-columns:1fr 1fr; }
+      .inv-drawer{ width:92vw; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ===== Intestazione ===== -->
+  <header class="hero">
+    <div class="hero-inner">
+      <h1 class="hero-title">🔥 No Udyr challeng</h1>
+      <div class="hero-actions">
+        <div id="userPill" class="user-pill" style="display:none">
+          <span id="userName" class="user-name">—</span>
+          <span class="coin-icon" aria-hidden="true"></span>
+          <span id="userUnspent" class="user-unspent">0</span>
+        </div>
+        <button id="btnAuth" class="btn hero-login" type="button">Accedi</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="page">
+    <!-- ===== Colonna SINISTRA (60%) ===== -->
+    <section class="left-card" aria-labelledby="left-title">
+      <h2 id="left-title" class="title" style="margin:0 0 8px">Preview carte</h2>
+
+      <!-- Creature con sub-tab Costo 2/3/5 -->
+      <div class="cat" id="cat-creature">
+        <div class="cat-head">
+          <h3 class="cat-title"><span class="cat-emoji">🐉</span> Creature</h3>
+          <div class="cat-line"></div>
+        </div>
+
+        <nav class="tabs" role="tablist" aria-label="Creature per costo" style="margin:4px 0 10px;">
+          <button class="tab is-active" role="tab" aria-selected="true" aria-controls="crea-2" data-target="crea-2">Costo 2</button>
+          <button class="tab" role="tab" aria-selected="false" aria-controls="crea-3" data-target="crea-3">Costo 3</button>
+          <button class="tab" role="tab" aria-selected="false" aria-controls="crea-5" data-target="crea-5">Costo 5</button>
+        </nav>
+
+        <div class="cards-row" id="crea-2" role="tabpanel" aria-labelledby="Costo 2">
+          <figure class="card-item"><img src="/assets/img/creature%202.png" alt="Creatura 2"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%203.png" alt="Creatura 3"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%205.png" alt="Creatura 5"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%202.png" alt="Creatura 2"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%203.png" alt="Creatura 3"/></figure>
+
+          <figure class="card-item"><img src="/assets/img/creature%205.png" alt="Creatura 5"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%202.png" alt="Creatura 2"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%203.png" alt="Creatura 3"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%205.png" alt="Creatura 5"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%202.png" alt="Creatura 2"/></figure>
+        </div>
+
+        <div class="cards-row" id="crea-3" role="tabpanel" aria-labelledby="Costo 3" style="display:none">
+          <figure class="card-item"><img src="/assets/img/creature%203.png" alt="Creatura 3"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%205.png" alt="Creatura 5"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%202.png" alt="Creatura 2"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%203.png" alt="Creatura 3"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%205.png" alt="Creatura 5"/></figure>
+
+          <figure class="card-item"><img src="/assets/img/creature%202.png" alt="Creatura 2"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%203.png" alt="Creatura 3"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%205.png" alt="Creatura 5"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%202.png" alt="Creatura 2"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%203.png" alt="Creatura 3"/></figure>
+        </div>
+
+        <div class="cards-row" id="crea-5" role="tabpanel" aria-labelledby="Costo 5" style="display:none">
+          <figure class="card-item"><img src="/assets/img/creature%205.png" alt="Creatura 5"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%202.png" alt="Creatura 2"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%203.png" alt="Creatura 3"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%205.png" alt="Creatura 5"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%202.png" alt="Creatura 2"/></figure>
+
+          <figure class="card-item"><img src="/assets/img/creature%203.png" alt="Creatura 3"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%205.png" alt="Creatura 5"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%202.png" alt="Creatura 2"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%203.png" alt="Creatura 3"/></figure>
+          <figure class="card-item"><img src="/assets/img/creature%205.png" alt="Creatura 5"/></figure>
+        </div>
+      </div>
+
+      <!-- Incantesimi -->
+      <div class="cat">
+        <div class="cat-head">
+          <h3 class="cat-title"><span class="cat-emoji">🪄</span> Incantesimi</h3>
+          <div class="cat-line"></div>
+        </div>
+        <div class="cards-row">
+          <figure class="card-item"><img src="/assets/img/incantesimi.png" alt="Incantesimo"/></figure>
+          <figure class="card-item"><img src="/assets/img/incantesimi.png" alt="Incantesimo"/></figure>
+          <figure class="card-item"><img src="/assets/img/incantesimi.png" alt="Incantesimo"/></figure>
+          <figure class="card-item"><img src="/assets/img/incantesimi.png" alt="Incantesimo"/></figure>
+          <figure class="card-item"><img src="/assets/img/incantesimi.png" alt="Incantesimo"/></figure>
+
+          <figure class="card-item"><img src="/assets/img/incantesimi.png" alt="Incantesimo"/></figure>
+          <figure class="card-item"><img src="/assets/img/incantesimi.png" alt="Incantesimo"/></figure>
+          <figure class="card-item"><img src="/assets/img/incantesimi.png" alt="Incantesimo"/></figure>
+          <figure class="card-item"><img src="/assets/img/incantesimi.png" alt="Incantesimo"/></figure>
+          <figure class="card-item"><img src="/assets/img/incantesimi.png" alt="Incantesimo"/></figure>
+        </div>
+      </div>
+
+      <!-- Istantanee -->
+      <div class="cat" style="margin-bottom:0;">
+        <div class="cat-head">
+          <h3 class="cat-title"><span class="cat-emoji">⚡</span> Istantanee</h3>
+          <div class="cat-line"></div>
+        </div>
+        <div class="cards-row">
+          <figure class="card-item"><img src="/assets/img/istantanea.png" alt="Istantanea"/></figure>
+          <figure class="card-item"><img src="/assets/img/istantanea.png" alt="Istantanea"/></figure>
+          <figure class="card-item"><img src="/assets/img/istantanea.png" alt="Istantanea"/></figure>
+          <figure class="card-item"><img src="/assets/img/istantanea.png" alt="Istantanea"/></figure>
+          <figure class="card-item"><img src="/assets/img/istantanea.png" alt="Istantanea"/></figure>
+
+          <figure class="card-item"><img src="/assets/img/istantanea.png" alt="Istantanea"/></figure>
+          <figure class="card-item"><img src="/assets/img/istantanea.png" alt="Istantanea"/></figure>
+          <figure class="card-item"><img src="/assets/img/istantanea.png" alt="Istantanea"/></figure>
+          <figure class="card-item"><img src="/assets/img/istantanea.png" alt="Istantanea"/></figure>
+          <figure class="card-item"><img src="/assets/img/istantanea.png" alt="Istantanea"/></figure>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== Colonna DESTRA (40%) ===== -->
+    <section class="column">
+      <!-- Classifica con TAB -->
+      <div class="card">
+        <nav class="tabs" role="tablist" aria-label="Selettore classifica">
+          <button id="tab-don" class="tab is-active" role="tab" aria-selected="true" aria-controls="leaderboardFrame" data-target="donators">Top Donator</button>
+          <button id="tab-unspent" class="tab" role="tab" aria-selected="false" aria-controls="leaderboardFrame" data-target="unspent">Punti non spesi</button>
+        </nav>
+        <div class="panel">
+          <h2 class="title" id="lb-title">Top Donator</h2>
+          <p class="muted" style="margin:6px 0 12px">Ogni <strong>sub</strong> vale <strong>+1 punto</strong>, ogni <strong>gift</strong> vale <strong>+N punti</strong> al gifter.</p>
+          <iframe
+            id="leaderboardFrame"
+            class="frame"
+            src="https://api.malgax.com/leaderboard.html"
+            title="Classifica"
+            loading="lazy"
+            referrerpolicy="no-referrer"
+          ></iframe>
+        </div>
+      </div>
+
+      <!-- Regole -->
+      <div class="card">
+        <nav class="tabs" role="tablist" aria-label="Regole della sfida">
+          <span class="tab is-active" role="tab" aria-selected="true" tabindex="0">📜 Regole</span>
+        </nav>
+        <div id="regole" class="rules" role="tabpanel" aria-labelledby="tab-regole">
+          <ul>
+            <li>❌ <strong>No Udyr</strong></li>
+            <li>🧭 <strong>Unranked → Master</strong></li>
+            <li>⏱️ <strong>Fine sfida:</strong> <em>30 settembre</em></li>
+            <li>🐉 <strong>Carte “Creature”:</strong> scegliete il <u>campione</u> che giocherò nella <u>prossima partita</u>.</li>
+            <li>🪄 <strong>“Incantesimi”:</strong> possono essere usati <u>prima</u> dell’inizio della partita.</li>
+            <li>⚡ <strong>“Istantanee”:</strong> possono essere usate <u>in qualsiasi momento</u> della partita.</li>
+          </ul>
+
+          <p class="muted" style="margin-top:14px">
+            Emote benvenute: 🎯🔥💥💫🧙‍♂️🐾 — fatevi sotto con le combo più folli!
+          </p>
+
+          <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap">
+            <span class="chip">🐉 Creature = pick forzato</span>
+            <span class="chip">🪄 Pre-game only</span>
+            <span class="chip">⚡ Anytime</span>
+            <span class="chip">⏱️ Deadline 30/09</span>
+            <span class="chip">🚫 No Udyr</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Overlay popup login -->
+  <div id="mask" class="modal-mask"></div>
+  <div id="modal" class="modal" aria-hidden="true" aria-modal="true" role="dialog">
+    <div class="box">
+      <div style="font-weight:700; margin-bottom:6px;">Accedi con Twitch</div>
+      <div class="muted">Si sta aprendo una finestra per l’accesso…<br/>Se il popup è bloccato, <a id="loginLink" href="https://api.malgax.com/auth/twitch" style="color:#9cb3ff">clicca qui</a>.</div>
+      <div class="hint">Al termine, questa finestra si chiuderà automaticamente.</div>
+    </div>
+  </div>
+
+  <!-- probe stato login -->
+  <iframe class="probe" src="https://api.malgax.com/profile.html?silent=1" title="probe" aria-hidden="true"></iframe>
+
+  <!-- ===== VIEWER FULLSCREEN ===== -->
+  <div id="viewerMask" class="viewer-mask" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="viewer" id="viewer">
+      <div class="viewer-inner" id="viewerInner">
+        <img id="viewerImg" class="viewer-img" src="" alt="" />
+        <div id="viewerShine" class="viewer-shine"></div>
+      </div>
+      <div class="viewer-actions">
+        <button id="viewerBuy" class="viewer-btn" type="button">🛒 Compra</button>
+        <button id="viewerClose" class="viewer-btn" type="button" aria-label="Chiudi">✕ Chiudi</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottone verticale Inventario + Drawer -->
+  <button id="invToggle" class="inv-toggle" type="button">Inventario</button>
+  <div id="invMask" class="inv-mask"></div>
+  <aside id="invDrawer" class="inv-drawer" aria-hidden="true" aria-label="Inventario">
+    <div class="inv-head">
+      <h3 class="inv-title">🎒 Inventario</h3>
+      <button id="invClose" class="inv-close" type="button">Chiudi</button>
+    </div>
+    <div id="invBody" class="inv-body">
+      <div class="inv-empty">Caricamento…</div>
+    </div>
+  </aside>
+
+  <script>
+    const API_ORIGIN="https://api.malgax.com";
+    const LOGIN_URL =API_ORIGIN+"/auth/twitch?popup=1";
+    const LOGOUT_URL=API_ORIGIN+"/logout?popup=1";
+
+    const btnAuth=document.getElementById('btnAuth');
+    const mask=document.getElementById('mask');
+    const modal=document.getElementById('modal');
+    const loginLink=document.getElementById('loginLink');
+
+    let loggedIn=false, authWin=null, monitor=null;
+    const setUI=()=>btnAuth.textContent=loggedIn?'Logout':'Accedi'; setUI();
+
+    function centerSpecs(w,h){
+      const l=window.screenLeft??screen.left, t=window.screenTop??screen.top;
+      const W=window.innerWidth||document.documentElement.clientWidth||screen.width;
+      const H=window.innerHeight||document.documentElement.clientHeight||screen.height;
+      return `scrollbars=yes,width=${w},height=${h},top=${t+Math.max(0,(H-h)/2)},left=${l+Math.max(0,(W-w)/2)}`;
+    }
+    function showModal(v){ mask.style.display=v?'block':'none'; modal.style.display=v?'flex':'none'; modal.setAttribute('aria-hidden',v?'false':'true'); }
+    function openPopup(url){
+      showModal(true);
+      authWin=window.open(url,'authPopup',centerSpecs(640,760));
+      if(!authWin||authWin.closed){ showModal(false); location.href=url.replace('?popup=1',''); return; }
+      monitor=setInterval(()=>{ if(authWin.closed){ clearInterval(monitor); showModal(false); } },300);
+    }
+
+    // ===== User pill (nome + punti) =====
+    const pillEl     = document.getElementById('userPill');
+    const pillNameEl = document.getElementById('userName');
+    const pillPtsEl  = document.getElementById('userUnspent');
+
+    function renderPill(me){
+      if(!me){
+        pillEl.style.display='none';
+        return;
+      }
+      const username = me.username || me.user || me.twitch_username || 'Utente';
+      const unspent  = (typeof me.unspent_points === 'number') ? me.unspent_points
+                    : (typeof me.points === 'number') ? me.points
+                    : 0;
+      pillNameEl.textContent = username;
+      pillPtsEl.textContent  = unspent;
+      pillEl.style.display   = 'flex';
+      loggedIn = true;
+      setUI();
+    }
+
+    async function fetchMe(){
+      try{
+        const res = await fetch(`${API_ORIGIN}/me`, { credentials:'include', cache:'no-store' });
+        if(!res.ok) return null;
+        return await res.json();
+      }catch(e){ return null; }
+    }
+    async function updateUserPill(){
+      const me = await fetchMe();
+      if(me && (me.username || me.user || me.twitch_username)){
+        renderPill(me);
+      }else{
+        pillEl.style.display = 'none';
+      }
+    }
+
+    // ==== NEW: chiusura popup lato parent se il login è andato a buon fine ====
+    async function waitForLoginAndClose(timeoutMs=15000){
+      const start=Date.now();
+      while(Date.now()-start < timeoutMs){
+        const me = await fetchMe();
+        if(me){
+          renderPill(me);
+          try{ if(authWin && !authWin.closed) authWin.close(); }catch(e){}
+          showModal(false);
+          return true;
+        }
+        await new Promise(r=>setTimeout(r,600));
+      }
+      // timeout: nascondi overlay ma lascia eventuale pagina aperta
+      showModal(false);
+      return false;
+    }
+
+    btnAuth.addEventListener('click',(e)=>{
+      e.preventDefault();
+      if(!loggedIn){
+        loginLink.href=LOGIN_URL;
+        openPopup(LOGIN_URL);
+        // parte il polling: quando /me diventa valido, chiude il popup
+        waitForLoginAndClose();
+      }else{
+        openPopup(LOGOUT_URL);
+        const start=Date.now();
+        const wait=setInterval(()=>{
+          const closed=!authWin||authWin.closed;
+          if(closed||Date.now()-start>6000){
+            clearInterval(wait);
+            loggedIn=false; setUI(); pillEl.style.display='none'; showModal(false);
+          }
+        },400);
       }
     });
-  });
-});
 
-// ========== API base ==========
-app.get('/me', async (req, res) => {
-  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
-  try {
-    const { rows } = await pool.query(
-      'SELECT id, twitch_id, username, total_points, unspent_points FROM users WHERE id=$1',
-      [req.user.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'not_found' });
-    res.json(rows[0]);
-  } catch (e) {
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-
-app.get('/health', (req, res) => res.type('text').send('ok'));
-
-// ========== Leaderboard JSON ==========
-app.get('/api/leaderboard', async (req, res) => {
-  const by = (req.query.by === 'unspent') ? 'unspent_points' : 'total_points';
-  try {
-    const { rows } = await pool.query(
-      `SELECT username, ${by} AS points
-       FROM users
-       ORDER BY ${by} DESC, username ASC
-       LIMIT 100`
-    );
-    res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-app.get('/api/leaderboard/top', (req, res) =>
-  pool.query(`SELECT username, total_points AS points FROM users ORDER BY total_points DESC, username ASC LIMIT 100`)
-    .then(r => res.json(r.rows)).catch(_ => res.status(500).json({ error: 'server_error' }))
-);
-app.get('/api/leaderboard/unspent', (req, res) =>
-  pool.query(`SELECT username, unspent_points AS points FROM users ORDER BY unspent_points DESC, username ASC LIMIT 100`)
-    .then(r => res.json(r.rows)).catch(_ => res.status(500).json({ error: 'server_error' }))
-);
-
-// ========== SHOP & INVENTARIO ==========
-app.get('/shop/items', async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT id, slug, name, kind, cost_points, image_url, description
-     FROM items
-     ORDER BY cost_points ASC, name ASC`
-  );
-  res.json(rows);
-});
-
-app.post('/shop/purchase', requireAuth, async (req, res) => {
-  const itemId = parseInt(req.body.item_id, 10);
-  const qty    = Math.max(1, parseInt(req.body.quantity || '1', 10));
-  const idem   = (req.headers['idempotency-key'] || '').toString().slice(0,128);
-
-  if (!Number.isFinite(itemId) || itemId <= 0) {
-    return res.status(400).json({ error: 'item_id non valido' });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const uRes = await client.query('SELECT id, unspent_points FROM users WHERE id=$1 FOR UPDATE', [req.user.id]);
-    if (!uRes.rows[0]) throw new Error('utente non trovato');
-    const user = uRes.rows[0];
-
-    const iRes = await client.query('SELECT id, name, cost_points FROM items WHERE id=$1', [itemId]);
-    if (!iRes.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'item non trovato' }); }
-    const item = iRes.rows[0];
-
-    const totalCost = item.cost_points * qty;
-    if (user.unspent_points < totalCost) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'punti insufficienti' });
-    }
-
-    await client.query(`
-      INSERT INTO user_items (user_id, item_id, quantity)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (user_id, item_id)
-      DO UPDATE SET quantity = user_items.quantity + EXCLUDED.quantity
-    `, [req.user.id, item.id, qty]);
-
-    const after = user.unspent_points - totalCost;
-    await client.query('UPDATE users SET unspent_points=$1, updated_at=NOW() WHERE id=$2', [after, req.user.id]);
-
-    await client.query(`
-      INSERT INTO point_transactions
-        (user_id, type, delta_points, item_id, quantity, client_token, points_before, points_after)
-      VALUES ($1, 'purchase', $2, $3, $4, NULLIF($5,''), $6, $7)
-    `, [req.user.id, -totalCost, item.id, qty, idem, user.unspent_points, after]);
-
-    await client.query('COMMIT');
-
-    res.json({ ok: true, item: { id: item.id, name: item.name, cost_points: item.cost_points }, quantity: qty, cost: totalCost, unspent_after: after });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: 'purchase_failed', detail: e.message });
-  } finally {
-    client.release();
-  }
-});
-
-app.get('/inventory', requireAuth, async (req, res) => {
-  const { rows } = await pool.query(`
-    SELECT i.id AS item_id, i.slug, i.name, i.kind, i.image_url, i.description, ui.quantity
-    FROM user_items ui
-    JOIN items i ON i.id = ui.item_id
-    WHERE ui.user_id = $1
-    ORDER BY i.kind, i.name
-  `, [req.user.id]);
-  res.json(rows);
-});
-
-app.post('/inventory/use', requireAuth, async (req, res) => {
-  const itemId = parseInt(req.body.item_id, 10);
-  const qty = Math.max(1, parseInt(req.body.quantity || '1', 10));
-  if (!Number.isFinite(itemId) || itemId <= 0) {
-    return res.status(400).json({ error: 'item_id non valido' });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const qRes = await client.query('SELECT quantity FROM user_items WHERE user_id=$1 AND item_id=$2 FOR UPDATE', [req.user.id, itemId]);
-    const have = qRes.rows[0]?.quantity || 0;
-    if (have < qty) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'quantità insufficiente' }); }
-
-    await client.query('UPDATE user_items SET quantity = quantity - $1 WHERE user_id=$2 AND item_id=$3', [qty, req.user.id, itemId]);
-
-    await client.query(`
-      INSERT INTO point_transactions (user_id, type, delta_points, item_id, quantity, points_before, points_after)
-      VALUES ($1, 'spend', 0, $2, $3,
-        (SELECT unspent_points FROM users WHERE id=$1),
-        (SELECT unspent_points FROM users WHERE id=$1))
-    `, [req.user.id, itemId, qty]);
-
-    await client.query('COMMIT');
-    res.json({ ok: true });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: 'use_failed', detail: e.message });
-  } finally {
-    client.release();
-  }
-});
-
-// ========== EventSub ==========
-function verifyTwitchSignature(req, rawBody) {
-  const id = req.header('Twitch-Eventsub-Message-Id') || '';
-  const ts = req.header('Twitch-Eventsub-Message-Timestamp') || '';
-  const sig = req.header('Twitch-Eventsub-Message-Signature') || ''; // "sha256=..."
-  const message = id + ts + rawBody;
-  const hmac = crypto.createHmac('sha256', TWITCH_EVENTSUB_SECRET || '');
-  const computed = 'sha256=' + hmac.update(message).digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(sig));
-}
-
-// Nota: questa route usa il body "raw" per validare la firma
-app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res) => {
-  const raw = req.body instanceof Buffer ? req.body.toString('utf8') : (typeof req.body === 'string' ? req.body : '');
-  const type = req.header('Twitch-Eventsub-Message-Type') || '';
-
-  if (type === 'webhook_callback_verification') {
-    try {
-      const payload = JSON.parse(raw);
-      return res.status(200).type('text/plain').send(payload.challenge);
-    } catch {
-      return res.status(400).send('bad_request');
-    }
-  }
-
-  if (!verifyTwitchSignature(req, raw)) {
-    return res.status(403).type('text/plain').send('Invalid signature');
-  }
-
-  let payload = null;
-  try { payload = JSON.parse(raw); } catch { return res.status(400).send('bad_json'); }
-
-  if (type === 'notification') {
-    const subType = payload.subscription?.type;
-    const ev = payload.event || {};
-
-    try {
-      const client = await pool.connect();
-      await client.query('BEGIN');
-
-      if (subType === 'channel.subscribe') {
-        const twitch_id = String(ev.user_id || '');
-        const username = ev.user_name || ev.user_login || null;
-        if (twitch_id) {
-          await grantPointsByTwitchId(client, twitch_id, username, 1);
-        }
-      } else if (subType === 'channel.subscription.gift') {
-        const isAnon = !!ev.is_anonymous;
-        if (!isAnon) {
-          const twitch_id = String(ev.user_id || '');
-          const username = ev.user_name || ev.user_login || null;
-          const n = Number(ev.total) > 0 ? Number(ev.total) : 1;
-          if (twitch_id) {
-            await grantPointsByTwitchId(client, twitch_id, username, n);
-          }
-        }
+    // Ricezione messaggi dal backend (ancora supportata, ma non più indispensabile)
+    window.addEventListener('message',(ev)=>{
+      if(ev.origin !== API_ORIGIN) return;
+      const d=ev.data||{};
+      if(d.type==='me'){
+        renderPill(d.me);
       }
+      if(d.type==='login'){
+        loggedIn=true; setUI();
+        try{ if(authWin&&!authWin.closed) authWin.close(); }catch(e){}
+        showModal(false);
+        updateUserPill();
+      }
+      if(d.type==='logout'){
+        loggedIn=false; setUI();
+        pillEl.style.display='none';
+        try{ if(authWin&&!authWin.closed) authWin.close(); }catch(e){}
+        showModal(false);
+      }
+    });
 
-      await client.query('COMMIT');
-      client.release();
-    } catch (e) {
-      console.error('EventSub handler error:', e);
+    // All'avvio, prova a leggere lo stato (se già loggato da cookie)
+    updateUserPill();
+
+    /* ===== Tabs classifica (switch iframe) ===== */
+    const frame = document.getElementById('leaderboardFrame');
+    const lbTitle = document.getElementById('lb-title');
+    (function(){
+      const tabs = document.querySelectorAll('.card > .tabs .tab');
+      tabs.forEach(tab=>{
+        if(!tab.dataset.target) return;
+        tab.addEventListener('click', ()=>{
+          tabs.forEach(t=>t.classList.remove('is-active'));
+          tab.classList.add('is-active');
+          const target = tab.dataset.target;
+          if(target === 'donators'){
+            frame.src = 'https://api.malgax.com/leaderboard.html';
+            lbTitle.textContent = 'Top Donator';
+          }else{
+            frame.src = 'https://api.malgax.com/unspent.html';
+            lbTitle.textContent = 'Punti non spesi';
+          }
+        });
+      });
+    })();
+
+    /* ===== Sub-tab Creature (Costo 2/3/5) ===== */
+    (function(){
+      const root  = document.getElementById('cat-creature');
+      if(!root) return;
+      const tabs  = root.querySelectorAll('.tabs .tab');
+      const panes = root.querySelectorAll('[role="tabpanel"]');
+      tabs.forEach(btn=>{
+        btn.addEventListener('click', ()=>{
+          tabs.forEach(b=>b.classList.remove('is-active'));
+          btn.classList.add('is-active');
+          panes.forEach(p=>p.style.display='none');
+          const id = btn.dataset.target;
+          const pane = root.querySelector('#'+id);
+          if(pane) pane.style.display = '';
+        });
+      });
+    })();
+
+    /* ====== VIEWER: fullscreen con 3D tilt ====== */
+    const viewerMask = document.getElementById('viewerMask');
+    const viewer = document.getElementById('viewer');
+    const viewerInner = document.getElementById('viewerInner');
+    const viewerImg = document.getElementById('viewerImg');
+    const viewerShine = document.getElementById('viewerShine');
+    const btnBuy = document.getElementById('viewerBuy');
+    const btnClose = document.getElementById('viewerClose');
+
+    const MAX_TILT = 14; // gradi
+    let idle = false, idleRAF = 0, idleStart = 0;
+
+    function startIdleTilt(){
+      idle = true;
+      idleStart = performance.now();
+      function loop(t){
+        if(!idle) return;
+        const k = (t - idleStart) / 1000;
+        const rx = Math.sin(k*1.3) * 6;
+        const ry = Math.cos(k*1.1) * 6;
+        viewerInner.style.transform = `rotateX(${rx}deg) rotateY(${ry}deg) scale(1.03)`;
+        viewerShine.style.setProperty('--sx', `${(Math.cos(k*1.2)*0.25+0.5)*100}%`);
+        viewerShine.style.setProperty('--sy', `${(Math.sin(k*1.2)*0.25+0.5)*100}%`);
+        idleRAF = requestAnimationFrame(loop);
+      }
+      idleRAF = requestAnimationFrame(loop);
     }
-  }
+    function stopIdleTilt(){
+      idle = false;
+      if(idleRAF) cancelAnimationFrame(idleRAF);
+      idleRAF = 0;
+    }
 
-  res.status(200).type('text/plain').send('ok');
-});
+    function openViewer(src, alt){
+      viewerImg.src = src;
+      viewerImg.alt = alt || '';
+      viewerMask.style.display = 'flex';
+      viewerMask.setAttribute('aria-hidden','false');
+      document.documentElement.style.overflow = 'hidden';
+      startIdleTilt();
+    }
+    function closeViewer(){
+      viewerMask.style.display = 'none';
+      viewerMask.setAttribute('aria-hidden','true');
+      document.documentElement.style.overflow = '';
+      stopIdleTilt();
+      viewerInner.style.transform = 'rotateX(0deg) rotateY(0deg) scale(1.0)';
+    }
 
-// ========== Static ==========
-app.use(express.static(path.join(__dirname, 'public')));
+    document.addEventListener('click', (e)=>{
+      const img = e.target.closest('.card-item img');
+      if(img){
+        e.preventDefault();
+        openViewer(img.currentSrc || img.src, img.alt);
+      }
+    });
 
-// Avvio
-app.listen(PORT, () => {
-  console.log(`Server avviato su http://localhost:${PORT}`);
-});
+    viewerMask.addEventListener('click', (e)=>{ if(e.target === viewerMask) closeViewer(); });
+    btnClose.addEventListener('click', closeViewer);
+    window.addEventListener('keydown', (e)=>{ if(e.key === 'Escape') closeViewer(); });
+
+    function onPointerMove(ev){
+      if(idle) stopIdleTilt();
+      const rect = viewer.getBoundingClientRect();
+      const px = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+      const py = Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height));
+      const rx = (0.5 - py) * MAX_TILT;
+      const ry = (px - 0.5) * MAX_TILT;
+      viewerInner.style.transform = `rotateX(${rx}deg) rotateY(${ry}deg) scale(1.03)`;
+      viewerShine.style.setProperty('--sx', `${px*100}%`);
+      viewerShine.style.setProperty('--sy', `${py*100}%`);
+    }
+    function onPointerLeave(){ startIdleTilt(); }
+
+    viewer.addEventListener('pointermove', onPointerMove);
+    viewer.addEventListener('pointerleave', onPointerLeave);
+
+    btnBuy.addEventListener('click', ()=>{
+      console.log('Compra cliccato per', viewerImg.src);
+    });
+
+    /* ===== INVENTORY DRAWER ===== */
+    const invToggle = document.getElementById('invToggle');
+    const invMask   = document.getElementById('invMask');
+    const invDrawer = document.getElementById('invDrawer');
+    const invBody   = document.getElementById('invBody');
+    const invClose  = document.getElementById('invClose');
+
+    async function loadInventory(){
+      invBody.innerHTML = '<div class="inv-empty">Caricamento…</div>';
+      try{
+        const res = await fetch(`${API_ORIGIN}/inventory`, { credentials:'include', cache:'no-store' });
+        if(res.status === 401){
+          invBody.innerHTML = '<div class="inv-empty">Devi accedere con Twitch.<br><br><button class="viewer-btn" id="invLoginBtn">Accedi</button></div>';
+          const b = document.getElementById('invLoginBtn');
+          if(b) b.addEventListener('click', ()=>openPopup && openPopup(LOGIN_URL));
+          return;
+        }
+        const data = await res.json();
+        if(!Array.isArray(data) || data.length === 0){
+          invBody.innerHTML = '<div class="inv-empty">Inventario vuoto.</div>';
+          return;
+        }
+        const grid = document.createElement('div');
+        grid.className = 'inv-grid';
+        data.forEach(it=>{
+          const card = document.createElement('div');
+          card.className = 'inv-card';
+          card.innerHTML = `
+            <div class="inv-thumb"><img src="${it.image_url}" alt="${it.name}"></div>
+            <div class="inv-info"><span>${it.name}</span><span class="inv-q">x${it.quantity}</span></div>
+          `;
+          grid.appendChild(card);
+        });
+        invBody.innerHTML = '';
+        invBody.appendChild(grid);
+      }catch(e){
+        invBody.innerHTML = '<div class="inv-empty">Errore nel caricamento.</div>';
+      }
+    }
+
+    function openInventory(){
+      invMask.style.display = 'block';
+      invDrawer.classList.add('open');
+      invDrawer.setAttribute('aria-hidden', 'false');
+      loadInventory();
+    }
+    function closeInventory(){
+      invMask.style.display = 'none';
+      invDrawer.classList.remove('open');
+      invDrawer.setAttribute('aria-hidden', 'true');
+    }
+
+    invToggle.addEventListener('click', openInventory);
+    invClose .addEventListener('click', closeInventory);
+    invMask  .addEventListener('click', closeInventory);
+  </script>
+</body>
+</html>
