@@ -1,33 +1,486 @@
-<!DOCTYPE html>
-<html lang="it">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Malgax Points – Home</title>
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      background: #f9f9f9;
-      text-align: center;
-      padding-top: 100px;
+// server.js
+require('dotenv').config();
+const express = require('express');
+const path = require('path');
+const crypto = require('crypto');
+const session = require('express-session');
+const cors = require('cors');
+const passport = require('passport');
+const TwitchStrategy = require('passport-twitch-new').Strategy;
+const { Pool } = require('pg');
+
+const {
+  PORT = 3000,
+  SESSION_SECRET = 'dev_secret_change_me',
+  TWITCH_CLIENT_ID,
+  TWITCH_CLIENT_SECRET,
+  TWITCH_CALLBACK_URL,       // es: https://api.malgax.com/auth/twitch/callback
+  TWITCH_EVENTSUB_SECRET,    // segreto per validare EventSub
+  DATABASE_URL               // stringa Neon
+} = process.env;
+
+if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET || !TWITCH_CALLBACK_URL) {
+  console.warn('[WARN] Twitch OAuth env non completi. Verifica .env su Render.');
+}
+if (!DATABASE_URL) {
+  console.warn('[WARN] DATABASE_URL mancante (Neon).');
+}
+if (!TWITCH_EVENTSUB_SECRET) {
+  console.warn('[WARN] TWITCH_EVENTSUB_SECRET mancante (EventSub).');
+}
+
+const app = express();
+app.set('trust proxy', 1);
+
+// CORS per il sito
+app.use(cors({
+  origin: ['https://www.malgax.com', 'https://malgax.com'],
+  credentials: true
+}));
+
+// Body parsers (NB: /eventsub usa raw json, configurato nella route)
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Sessione (cookie cross-site)
+app.use(session({
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: 'none',
+    secure: true,
+    maxAge: 1000 * 60 * 60 * 24 * 30
+  }
+}));
+
+// DB (Neon Postgres)
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Passport
+passport.serializeUser((user, done) => {
+  done(null, { id: user.id, twitch_id: user.twitch_id, username: user.username });
+});
+passport.deserializeUser((obj, done) => done(null, obj));
+
+passport.use(new TwitchStrategy({
+  clientID: TWITCH_CLIENT_ID,
+  clientSecret: TWITCH_CLIENT_SECRET,
+  callbackURL: TWITCH_CALLBACK_URL,
+  scope: ['user:read:email', 'channel:read:subscriptions']
+}, async (accessToken, refreshToken, profile, done) => {
+  try {
+    const tid = String(profile.id);
+    const uname = profile.display_name || profile.username || profile.login || 'Utente';
+    const upsert = await pool.query(`
+      INSERT INTO users (twitch_id, username)
+      VALUES ($1, $2)
+      ON CONFLICT (twitch_id)
+      DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
+      RETURNING id, twitch_id, username, total_points, unspent_points
+    `, [tid, uname]);
+    const user = upsert.rows[0];
+    return done(null, user);
+  } catch (e) {
+    return done(e);
+  }
+}));
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+// ========== DB: schema base + inventario/ledger ==========
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      twitch_id TEXT UNIQUE NOT NULL,
+      username TEXT,
+      total_points INTEGER NOT NULL DEFAULT 0,
+      unspent_points INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tid ON users(twitch_id);
+
+    CREATE TABLE IF NOT EXISTS items (
+      id SERIAL PRIMARY KEY,
+      slug TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('creature','spell','instant')),
+      cost_points INTEGER NOT NULL CHECK (cost_points > 0),
+      image_url TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS user_items (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+      quantity INTEGER NOT NULL CHECK (quantity >= 0),
+      UNIQUE(user_id, item_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS point_transactions (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type TEXT NOT NULL CHECK (type IN ('purchase','spend','grant','refund')),
+      delta_points INTEGER NOT NULL,
+      item_id INTEGER REFERENCES items(id),
+      quantity INTEGER,
+      client_token TEXT,
+      points_before INTEGER NOT NULL,
+      points_after  INTEGER NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_user_items_user ON user_items(user_id);
+    CREATE INDEX IF NOT EXISTS idx_tx_user_created ON point_transactions(user_id, created_at DESC);
+  `);
+}
+initDb().catch(err => {
+  console.error('DB init error:', err);
+  process.exit(1);
+});
+
+// Utils
+function requireAuth(req, res, next) {
+  if (req.isAuthenticated && req.isAuthenticated()) return next();
+  return res.status(401).json({ error: 'unauthorized' });
+}
+
+async function grantPointsByTwitchId(client, twitch_id, username, delta) {
+  const uRes = await client.query(`
+    INSERT INTO users (twitch_id, username)
+    VALUES ($1, $2)
+    ON CONFLICT (twitch_id)
+    DO UPDATE SET username = COALESCE(EXCLUDED.username, users.username), updated_at=NOW()
+    RETURNING id, total_points, unspent_points
+  `, [twitch_id, username || null]);
+  const u = uRes.rows[0];
+
+  const before = u.unspent_points;
+  const after  = u.unspent_points + delta;
+
+  await client.query(
+    'UPDATE users SET total_points = total_points + $1, unspent_points = unspent_points + $1, updated_at=NOW() WHERE id=$2',
+    [delta, u.id]
+  );
+
+  await client.query(`
+    INSERT INTO point_transactions (user_id, type, delta_points, points_before, points_after)
+    VALUES ($1, 'grant', $2, $3, $4)
+  `, [u.id, delta, before, after]);
+}
+
+// ========== OAuth ==========
+app.get('/auth/twitch', (req, res, next) => {
+  const state = req.query.popup === '1' ? 'popup' : 'redir';
+  passport.authenticate('twitch', { state })(req, res, next);
+});
+
+// callback “robusto”: invia messaggio + tenta più volte di chiudere il popup
+app.get('/auth/twitch/callback',
+  passport.authenticate('twitch', { failureRedirect: '/auth-failed.html' }),
+  async (req, res) => {
+    const isPopup = req.query.state === 'popup' || req.query.popup === '1';
+    if (isPopup) {
+      res.type('html').send(`
+        <!doctype html><meta charset="utf-8"><title>Login OK</title>
+        <script>
+          (function(){
+            function notify(){
+              try{ if(window.opener) window.opener.postMessage({type:'login'}, '*'); }catch(e){}
+              try{ if(window.parent && window.parent!==window) window.parent.postMessage({type:'login'}, '*'); }catch(e){}
+            }
+            notify();
+
+            let attempts = 0;
+            function tryClose(){
+              attempts++;
+              try { window.close(); } catch(e) {}
+              if (window.closed) return;
+              if (attempts < 8) setTimeout(tryClose, attempts < 3 ? 120 : 250);
+              else {
+                // extrema ratio: mostra messaggio e riprova chiusura
+                document.body.style = 'margin:0;background:#0f0f14;color:#fff;font:14px system-ui,Segoe UI,Roboto,Arial';
+                document.body.innerHTML = '<div style="padding:20px">Login completato. Questa finestra può essere chiusa.<br><br><button id="b" style="padding:10px 14px;border-radius:10px;border:1px solid #444;background:#6441a5;color:#fff;font-weight:800;cursor:pointer">Chiudi</button></div>';
+                document.getElementById('b').onclick = function(){
+                  notify();
+                  try { window.open('','_self'); } catch(e){}
+                  try { window.close(); } catch(e){}
+                };
+                // ancora qualche tentativo automatico
+                setTimeout(function(){ notify(); try { window.close(); } catch(e){} }, 600);
+                setTimeout(function(){ notify(); try { window.close(); } catch(e){} }, 1200);
+              }
+            }
+            // piccolo delay per dare tempo al browser di “legare” opener
+            setTimeout(tryClose, 60);
+          })();
+        </script>
+        <noscript>Login completato. Puoi chiudere questa finestra.</noscript>
+      `);
+    } else {
+      res.redirect('/profile.html');
     }
-    a.login {
-      display: inline-block;
-      padding: 15px 25px;
-      background: #6441a5;
-      color: #fff;
-      font-size: 18px;
-      text-decoration: none;
-      border-radius: 8px;
+  }
+);
+
+app.get('/logout', (req, res, next) => {
+  const isPopup = req.query.popup === '1';
+  req.logout(err => {
+    if (err) return next(err);
+    req.session.destroy(() => {
+      if (isPopup) {
+        res.type('html').send(`
+          <!doctype html><meta charset="utf-8"><title>Logout</title>
+          <script>
+            try{ if(window.opener) window.opener.postMessage({type:'logout'}, '*'); }catch(e){}
+            try{ if(window.parent && window.parent!==window) window.parent.postMessage({type:'logout'}, '*'); }catch(e){}
+            try { window.close(); } catch(e){}
+            setTimeout(function(){ try{ window.close(); }catch(e){} }, 250);
+            setTimeout(function(){ document.body.innerHTML = 'Logout eseguito. Puoi chiudere questa finestra.'; }, 800);
+          </script>
+          <noscript>Logout eseguito. Puoi chiudere questa finestra.</noscript>
+        `);
+      } else {
+        res.redirect('/profile.html');
+      }
+    });
+  });
+});
+
+// ========== API base ==========
+app.get('/me', async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, twitch_id, username, total_points, unspent_points FROM users WHERE id=$1',
+      [req.user.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'not_found' });
+    res.json(rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get('/health', (req, res) => res.type('text').send('ok'));
+
+// ========== Leaderboard JSON ==========
+app.get('/api/leaderboard', async (req, res) => {
+  const by = (req.query.by === 'unspent') ? 'unspent_points' : 'total_points';
+  try {
+    const { rows } = await pool.query(
+      `SELECT username, ${by} AS points
+       FROM users
+       ORDER BY ${by} DESC, username ASC
+       LIMIT 100`
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+app.get('/api/leaderboard/top', (req, res) =>
+  pool.query(`SELECT username, total_points AS points FROM users ORDER BY total_points DESC, username ASC LIMIT 100`)
+    .then(r => res.json(r.rows)).catch(_ => res.status(500).json({ error: 'server_error' }))
+);
+app.get('/api/leaderboard/unspent', (req, res) =>
+  pool.query(`SELECT username, unspent_points AS points FROM users ORDER BY unspent_points DESC, username ASC LIMIT 100`)
+    .then(r => res.json(r.rows)).catch(_ => res.status(500).json({ error: 'server_error' }))
+);
+
+// ========== SHOP & INVENTARIO ==========
+app.get('/shop/items', async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, slug, name, kind, cost_points, image_url, description
+     FROM items
+     ORDER BY cost_points ASC, name ASC`
+  );
+  res.json(rows);
+});
+
+app.post('/shop/purchase', requireAuth, async (req, res) => {
+  const itemId = parseInt(req.body.item_id, 10);
+  const qty    = Math.max(1, parseInt(req.body.quantity || '1', 10));
+  const idem   = (req.headers['idempotency-key'] || '').toString().slice(0,128);
+
+  if (!Number.isFinite(itemId) || itemId <= 0) {
+    return res.status(400).json({ error: 'item_id non valido' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const uRes = await client.query('SELECT id, unspent_points FROM users WHERE id=$1 FOR UPDATE', [req.user.id]);
+    if (!uRes.rows[0]) throw new Error('utente non trovato');
+    const user = uRes.rows[0];
+
+    const iRes = await client.query('SELECT id, name, cost_points FROM items WHERE id=$1', [itemId]);
+    if (!iRes.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'item non trovato' }); }
+    const item = iRes.rows[0];
+
+    const totalCost = item.cost_points * qty;
+    if (user.unspent_points < totalCost) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'punti insufficienti' });
     }
-    a.login:hover {
-      background: #7d5bbe;
+
+    await client.query(`
+      INSERT INTO user_items (user_id, item_id, quantity)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (user_id, item_id)
+      DO UPDATE SET quantity = user_items.quantity + EXCLUDED.quantity
+    `, [req.user.id, item.id, qty]);
+
+    const after = user.unspent_points - totalCost;
+    await client.query('UPDATE users SET unspent_points=$1, updated_at=NOW() WHERE id=$2', [after, req.user.id]);
+
+    await client.query(`
+      INSERT INTO point_transactions
+        (user_id, type, delta_points, item_id, quantity, client_token, points_before, points_after)
+      VALUES ($1, 'purchase', $2, $3, $4, NULLIF($5,''), $6, $7)
+    `, [req.user.id, -totalCost, item.id, qty, idem, user.unspent_points, after]);
+
+    await client.query('COMMIT');
+
+    res.json({ ok: true, item: { id: item.id, name: item.name, cost_points: item.cost_points }, quantity: qty, cost: totalCost, unspent_after: after });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'purchase_failed', detail: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/inventory', requireAuth, async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT i.id AS item_id, i.slug, i.name, i.kind, i.image_url, i.description, ui.quantity
+    FROM user_items ui
+    JOIN items i ON i.id = ui.item_id
+    WHERE ui.user_id = $1
+    ORDER BY i.kind, i.name
+  `, [req.user.id]);
+  res.json(rows);
+});
+
+app.post('/inventory/use', requireAuth, async (req, res) => {
+  const itemId = parseInt(req.body.item_id, 10);
+  const qty = Math.max(1, parseInt(req.body.quantity || '1', 10));
+  if (!Number.isFinite(itemId) || itemId <= 0) {
+    return res.status(400).json({ error: 'item_id non valido' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const qRes = await client.query('SELECT quantity FROM user_items WHERE user_id=$1 AND item_id=$2 FOR UPDATE', [req.user.id, itemId]);
+    const have = qRes.rows[0]?.quantity || 0;
+    if (have < qty) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'quantità insufficiente' }); }
+
+    await client.query('UPDATE user_items SET quantity = quantity - $1 WHERE user_id=$2 AND item_id=$3', [qty, req.user.id, itemId]);
+
+    await client.query(`
+      INSERT INTO point_transactions (user_id, type, delta_points, item_id, quantity, points_before, points_after)
+      VALUES ($1, 'spend', 0, $2, $3,
+        (SELECT unspent_points FROM users WHERE id=$1),
+        (SELECT unspent_points FROM users WHERE id=$1))
+    `, [req.user.id, itemId, qty]);
+
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'use_failed', detail: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ========== EventSub ==========
+function verifyTwitchSignature(req, rawBody) {
+  const id = req.header('Twitch-Eventsub-Message-Id') || '';
+  const ts = req.header('Twitch-Eventsub-Message-Timestamp') || '';
+  const sig = req.header('Twitch-Eventsub-Message-Signature') || ''; // "sha256=..."
+  const message = id + ts + rawBody;
+  const hmac = crypto.createHmac('sha256', TWITCH_EVENTSUB_SECRET || '');
+  const computed = 'sha256=' + hmac.update(message).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(sig));
+}
+
+// Nota: questa route usa il body "raw" per validare la firma
+app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res) => {
+  const raw = req.body instanceof Buffer ? req.body.toString('utf8') : (typeof req.body === 'string' ? req.body : '');
+  const type = req.header('Twitch-Eventsub-Message-Type') || '';
+
+  // Callback verification (challenge)
+  if (type === 'webhook_callback_verification') {
+    try {
+      const payload = JSON.parse(raw);
+      return res.status(200).type('text/plain').send(payload.challenge);
+    } catch {
+      return res.status(400).send('bad_request');
     }
-  </style>
-</head>
-<body>
-  <h1>Benvenuto su Malgax Points 🚀</h1>
-  <p>Accedi con Twitch per iniziare a guadagnare punti!</p>
-  <a class="login" href="/auth/twitch">Accedi con Twitch</a>
-</body>
-</html>
+  }
+
+  // Verifica firma per notifiche e revoche
+  if (!verifyTwitchSignature(req, raw)) {
+    return res.status(403).type('text/plain').send('Invalid signature');
+  }
+
+  let payload = null;
+  try { payload = JSON.parse(raw); } catch { return res.status(400).send('bad_json'); }
+
+  if (type === 'notification') {
+    const subType = payload.subscription?.type;
+    const ev = payload.event || {};
+
+    try {
+      const client = await pool.connect();
+      await client.query('BEGIN');
+
+      if (subType === 'channel.subscribe') {
+        const twitch_id = String(ev.user_id || '');
+        const username = ev.user_name || ev.user_login || null;
+        if (twitch_id) {
+          await grantPointsByTwitchId(client, twitch_id, username, 1);
+        }
+      } else if (subType === 'channel.subscription.gift') {
+        const isAnon = !!ev.is_anonymous;
+        if (!isAnon) {
+          const twitch_id = String(ev.user_id || '');
+          const username = ev.user_name || ev.user_login || null;
+          const n = Number(ev.total) > 0 ? Number(ev.total) : 1;
+          if (twitch_id) {
+            await grantPointsByTwitchId(client, twitch_id, username, n);
+          }
+        }
+      }
+
+      await client.query('COMMIT');
+      client.release();
+    } catch (e) {
+      console.error('EventSub handler error:', e);
+    }
+  }
+
+  // 2xx obbligatorio
+  res.status(200).type('text/plain').send('ok');
+});
+
+// ========== Static ==========
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Avvio
+app.listen(PORT, () => {
+  console.log(`Server avviato su http://localhost:${PORT}`);
+});
