@@ -179,16 +179,23 @@ async function grantPointsByTwitchId(client, twitch_id, username, delta) {
 }
 
 // ========== OAuth ==========
+// Salva in sessione se è un popup (non ci fidiamo dello "state" di ritorno)
 app.get('/auth/twitch', (req, res, next) => {
-  const state = req.query.popup === '1' ? 'popup' : 'redir';
+  const isPopup = req.query.popup === '1';
+  req.session.isPopup = isPopup;
+  // manteniamo anche uno state informativo, ma il flag di sessione è la fonte di verità
+  const state = isPopup ? 'popup' : 'redir';
   passport.authenticate('twitch', { state })(req, res, next);
 });
 
-// callback “robusto”: invia messaggio + tenta più volte di chiudere il popup
+// callback “a prova di tutto”: usa il flag di sessione per capire il flusso popup
 app.get('/auth/twitch/callback',
   passport.authenticate('twitch', { failureRedirect: '/auth-failed.html' }),
   async (req, res) => {
-    const isPopup = req.query.state === 'popup' || req.query.popup === '1';
+    const isPopup = !!req.session.isPopup || req.query.state === 'popup' || req.query.popup === '1';
+    // una volta letto, azzera per sicurezza
+    req.session.isPopup = undefined;
+
     if (isPopup) {
       res.type('html').send(`
         <!doctype html><meta charset="utf-8"><title>Login OK</title>
@@ -205,23 +212,22 @@ app.get('/auth/twitch/callback',
               attempts++;
               try { window.close(); } catch(e) {}
               if (window.closed) return;
-              if (attempts < 8) setTimeout(tryClose, attempts < 3 ? 120 : 250);
-              else {
-                // extrema ratio: mostra messaggio e riprova chiusura
+              if (attempts < 10) {
+                setTimeout(tryClose, attempts < 4 ? 100 : 250);
+              } else {
                 document.body.style = 'margin:0;background:#0f0f14;color:#fff;font:14px system-ui,Segoe UI,Roboto,Arial';
                 document.body.innerHTML = '<div style="padding:20px">Login completato. Questa finestra può essere chiusa.<br><br><button id="b" style="padding:10px 14px;border-radius:10px;border:1px solid #444;background:#6441a5;color:#fff;font-weight:800;cursor:pointer">Chiudi</button></div>';
                 document.getElementById('b').onclick = function(){
                   notify();
-                  try { window.open('','_self'); } catch(e){}
+                  try { window.open("","_self"); } catch(e){}
                   try { window.close(); } catch(e){}
                 };
-                // ancora qualche tentativo automatico
+                // ulteriori tentativi automatici
                 setTimeout(function(){ notify(); try { window.close(); } catch(e){} }, 600);
                 setTimeout(function(){ notify(); try { window.close(); } catch(e){} }, 1200);
               }
             }
-            // piccolo delay per dare tempo al browser di “legare” opener
-            setTimeout(tryClose, 60);
+            setTimeout(tryClose, 80);
           })();
         </script>
         <noscript>Login completato. Puoi chiudere questa finestra.</noscript>
@@ -233,7 +239,8 @@ app.get('/auth/twitch/callback',
 );
 
 app.get('/logout', (req, res, next) => {
-  const isPopup = req.query.popup === '1';
+  const isPopup = req.query.popup === '1' || req.session.isPopup === true;
+  req.session.isPopup = undefined;
   req.logout(err => {
     if (err) return next(err);
     req.session.destroy(() => {
@@ -245,7 +252,10 @@ app.get('/logout', (req, res, next) => {
             try{ if(window.parent && window.parent!==window) window.parent.postMessage({type:'logout'}, '*'); }catch(e){}
             try { window.close(); } catch(e){}
             setTimeout(function(){ try{ window.close(); }catch(e){} }, 250);
-            setTimeout(function(){ document.body.innerHTML = 'Logout eseguito. Puoi chiudere questa finestra.'; }, 800);
+            setTimeout(function(){
+              document.body.style='margin:0;background:#0f0f14;color:#fff;font:14px system-ui,Segoe UI,Roboto,Arial';
+              document.body.innerHTML='Logout eseguito. Puoi chiudere questa finestra.';
+            }, 800);
           </script>
           <noscript>Logout eseguito. Puoi chiudere questa finestra.</noscript>
         `);
@@ -422,7 +432,6 @@ app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res
   const raw = req.body instanceof Buffer ? req.body.toString('utf8') : (typeof req.body === 'string' ? req.body : '');
   const type = req.header('Twitch-Eventsub-Message-Type') || '';
 
-  // Callback verification (challenge)
   if (type === 'webhook_callback_verification') {
     try {
       const payload = JSON.parse(raw);
@@ -432,7 +441,6 @@ app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res
     }
   }
 
-  // Verifica firma per notifiche e revoche
   if (!verifyTwitchSignature(req, raw)) {
     return res.status(403).type('text/plain').send('Invalid signature');
   }
@@ -473,7 +481,6 @@ app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res
     }
   }
 
-  // 2xx obbligatorio
   res.status(200).type('text/plain').send('ok');
 });
 
