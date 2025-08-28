@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Inventario – Malgax Points</title>
+  <style>
+    :root{ --bg:#0f0f14; --fg:#f4f4f7; --muted:#a4a4b5; --card:#16161f; --twitch:#6441a5; }
+    *{ box-sizing:border-box }
+    body{ margin:0; font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif; background:var(--bg); color:var(--fg); }
+    .wrap{ max-width:900px; margin:28px auto; padding:0 18px; }
+    h1{ margin:0 0 14px }
+    .grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px }
+    @media (max-width:900px){ .grid{ grid-template-columns:repeat(2,1fr) } }
+    @media (max-width:560px){ .grid{ grid-template-columns:1fr } }
+    .card{ background:var(--card); border:1px solid rgba(255,255,255,.08); border-radius:14px; overflow:hidden; display:flex; flex-direction:column; }
+    .thumb{ aspect-ratio:2/3; display:flex; align-items:center; justify-content:center; background:#0b0b10; }
+    .thumb img{ width:100%; height:100%; object-fit:contain }
+    .info{ padding:12px; border-top:1px solid rgba(255,255,255,.06); display:flex; flex-direction:column; gap:8px }
+    .row{ display:flex; align-items:center; justify-content:space-between; gap:10px }
+    .muted{ color:#a4a4b5 }
+    .btn{ appearance:none; border:0; border-radius:10px; padding:10px 12px; background:var(--twitch); color:#fff; font-weight:800; cursor:pointer }
+    .empty{ color:#a4a4b5; margin-top:12px }
+    .toast{ position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:#121219; color:#fff; border:1px solid rgba(255,255,255,.16); padding:10px 12px; border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.4); display:none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Inventario</h1>
+    <div id="grid" class="grid"></div>
+    <div id="empty" class="empty" style="display:none">Inventario vuoto.</div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    async function showToast(msg, ms=2000){ const t=document.getElementById('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none', ms); }
+
+    async function loadInventory(){
+      const grid=document.getElementById('grid');
+      const empty=document.getElementById('empty');
+      grid.innerHTML = '<div class="muted">Caricamento…</div>';
+      empty.style.display='none';
+      try{
+        const r=await fetch('/inventory', {credentials:'include', cache:'no-store'});
+        if(r.status===401){ grid.innerHTML='<div class="muted">Devi accedere con Twitch.</div>'; return; }
+        const items=await r.json();
+        if(!Array.isArray(items) || !items.length){ grid.innerHTML=''; empty.style.display='block'; return; }
+        grid.innerHTML='';
+        items.forEach(it=>{
+          const el=document.createElement('div');
+          el.className='card';
+          el.innerHTML=`
+            <div class="thumb"><img src="${it.image_url}" alt="${it.name}"></div>
+            <div class="info">
+              <div class="row"><strong>${it.name}</strong><span class="muted">${it.kind}</span></div>
+              <div class="row"><span class="muted">Q.ta</span><strong id="q${it.item_id}">${it.quantity}</strong></div>
+              <div class="row"><button class="btn" data-id="${it.item_id}">Usa 1</button></div>
+            </div>
+          `;
+          grid.appendChild(el);
+        });
+
+        grid.addEventListener('click', async (e)=>{
+          const b = e.target.closest('button.btn'); if(!b) return;
+          const id = Number(b.dataset.id);
+          b.disabled = true;
+          try{
+            const r = await fetch('/inventory/use', {
+              method:'POST', credentials:'include',
+              headers:{ 'Content-Type':'application/json' },
+              body: JSON.stringify({ item_id:id, quantity:1 })
+            });
+            const j = await r.json();
+            if(!r.ok){ throw new Error(j.error || 'use_failed'); }
+            const qEl = document.getElementById('q'+id);
+            const cur = Number(qEl.textContent||'0');
+            qEl.textContent = Math.max(0, cur-1);
+            showToast('Usato 1 oggetto');
+          }catch(err){
+            showToast('Errore: '+err.message, 2500);
+          }finally{
+            b.disabled=false;
+          }
+        });
+
+      }catch(_){
+        grid.innerHTML='<div class="muted">Errore nel caricamento.</div>';
+      }
+    }
+
+    loadInventory();
+  </script>
+</body>
+</html>

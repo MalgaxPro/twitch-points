@@ -1,101 +1,90 @@
 <!DOCTYPE html>
 <html lang="it">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
-  <title>Profilo — Malgax</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Profilo – Malgax Points</title>
   <style>
-    body {
-      margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
-      background:#0f0f14; color:#f4f4f7;
-      display:flex; align-items:center; justify-content:center; min-height:100vh;
+    :root{ --bg:#0f0f14; --fg:#f4f4f7; --muted:#a4a4b5; --card:#16161f; --twitch:#6441a5; }
+    *{ box-sizing:border-box }
+    body{ margin:0; font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif; background:var(--bg); color:var(--fg); }
+    .wrap{ max-width:720px; margin:40px auto; padding:20px; }
+    .card{ background:var(--card); border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:18px; }
+    .muted{ color:var(--muted) }
+    .row{ display:flex; gap:14px; align-items:center; }
+    .coin{
+      width:16px; height:16px; border-radius:50%; display:inline-block; margin:0 6px;
+      background: radial-gradient(90% 90% at 30% 30%, #fff4a6 0%, #ffd94d 35%, #e0a300 60%, #b07b00 100%);
+      box-shadow: inset 0 0 0 1px rgba(0,0,0,.25), 0 1px 4px rgba(0,0,0,.35);
     }
-    .card { background:#16161f; border:1px solid rgba(255,255,255,.08); padding:22px; border-radius:14px; width:min(520px,92%); }
-    h1 { margin:0 0 10px; font-size:22px; }
-    .muted { color:#a4a4b5; }
-    .row { margin:10px 0; }
-    a.btn { display:inline-block; margin-top:12px; padding:10px 14px; border-radius:10px; text-decoration:none; }
-    .primary { background:#6441a5; color:#fff; }
+    .btn{ appearance:none; border:0; border-radius:10px; padding:10px 14px; background:var(--twitch); color:#fff; font-weight:700; cursor:pointer; }
+    a.btn{ text-decoration:none; display:inline-block }
+    .actions{ display:flex; gap:10px; margin-top:12px }
   </style>
 </head>
 <body>
-  <div id="card" class="card">
-    <h1>Profilo</h1>
-    <div id="content" class="muted">Caricamento…</div>
-    <div class="row">
-      <!-- IMPORTANTE: logout con popup=1 così la finestra si chiude da sola -->
-      <a id="logoutBtn" class="btn primary" href="/logout?popup=1">Logout</a>
+  <div class="wrap">
+    <div class="card" id="view">
+      <div class="muted">Caricamento profilo…</div>
     </div>
   </div>
 
   <script>
-    // Origini consentite del sito pubblico (parent/opener)
-    const SITE_ORIGINS = [
-      'https://www.malgax.com',
-      'https://malgax.com'
-    ];
-
-    function notifyAllTargets(payload) {
-      try {
-        // notifica il parent (iframe) e l'opener (popup)
-        SITE_ORIGINS.forEach(o => { try { window.parent.postMessage(payload, o); } catch(e){} });
-        if (window.opener) {
-          SITE_ORIGINS.forEach(o => { try { window.opener.postMessage(payload, o); } catch(e){} });
-        }
-      } catch (e) {}
-    }
-
-    // Se qualcuno apre questa pagina in popup e preme il link Logout SENZA ?popup=1,
-    // forziamo noi l'aggiunta del flag.
-    (function ensurePopupParamOnLogout(){
-      const a = document.getElementById('logoutBtn');
-      if (!a) return;
-      a.addEventListener('click', (ev) => {
-        try {
-          const hasOpener = !!window.opener;
-          const url = new URL(a.href, window.location.origin);
-          if (hasOpener) {
-            url.searchParams.set('popup', '1');
-            a.href = url.toString();
-          }
-        } catch(e){}
-      });
-    })();
-
-    async function loadMe() {
-      const qs = new URLSearchParams(location.search);
-      const isPopup  = qs.get('popup')  === '1';
-      const isSilent = qs.get('silent') === '1';
-      if (isSilent) {
-        const card = document.getElementById('card');
-        if (card) card.style.display = 'none';
-      }
-
-      try {
+    (async function(){
+      const q = new URLSearchParams(location.search);
+      const silent = q.get('silent') === '1';
+      try{
         const res = await fetch('/me', { credentials: 'include', cache: 'no-store' });
-        if (!res.ok) {
-          document.getElementById('content').textContent = 'Non sei autenticato.';
-          notifyAllTargets({ type: 'logout' });
-          return;
-        }
-        const me = await res.json();
-        document.getElementById('content').innerHTML =
-          `<div><strong>Utente:</strong> ${me.username || '(sconosciuto)'}</div>
-           <div><strong>Punti:</strong> ${Number(me.points||0)}</div>`;
+        let me = null;
+        if(res.ok){ me = await res.json(); }
 
-        // Notifica subito lo stato alla home
-        notifyAllTargets({ type: 'login' });
+        const payload = {
+          type: 'me',
+          me: me ? {
+            username: me.username || me.user || me.twitch_username || 'Utente',
+            unspent_points: (typeof me.unspent_points === 'number') ? me.unspent_points
+                              : (typeof me.points === 'number') ? me.points : 0
+          } : null
+        };
 
-        // Chiude SUBITO se aperta come popup di ritorno dall'OAuth
-        if (isPopup) {
-          setTimeout(() => { try { window.close(); } catch(e){} }, 0);
+        // invia lo stato al sito (iframe nascosto) e al popup (se presente)
+        try{ if(window.parent && window.parent !== window) window.parent.postMessage(payload, '*'); }catch(_){}
+        try{ if(window.opener) window.opener.postMessage(payload, '*'); }catch(_){}
+
+        if(!silent){
+          const v = document.getElementById('view');
+          if(me){
+            v.innerHTML = `
+              <h2>Profilo</h2>
+              <p><strong>Utente:</strong> ${payload.me.username}</p>
+              <p><strong>Punti disponibili:</strong> <span class="coin"></span> ${payload.me.unspent_points}</p>
+              <div class="actions">
+                <a class="btn" href="/logout">Logout</a>
+              </div>
+              <p class="muted" style="margin-top:10px">Questa pagina comunica il tuo stato di login al sito principale.</p>
+            `;
+          }else{
+            v.innerHTML = `
+              <h2>Non autenticato</h2>
+              <p class="muted">Effettua l'accesso con Twitch per vedere il profilo.</p>
+              <div class="actions">
+                <a class="btn" href="/auth/twitch">Accedi con Twitch</a>
+              </div>
+            `;
+          }
         }
-      } catch (e) {
-        document.getElementById('content').textContent = 'Errore nel caricamento.';
+      }catch(e){
+        const payload = { type:'me', me:null };
+        try{ if(window.parent && window.parent !== window) window.parent.postMessage(payload, '*'); }catch(_){}
+        try{ if(window.opener) window.opener.postMessage(payload, '*'); }catch(_){}
+        if(!silent){
+          document.getElementById('view').innerHTML = `
+            <h2>Errore</h2>
+            <p class="muted">Impossibile caricare il profilo al momento.</p>
+          `;
+        }
       }
-    }
-
-    loadMe();
+    })();
   </script>
 </body>
 </html>

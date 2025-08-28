@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Shop – Malgax Points</title>
+  <style>
+    :root{ --bg:#0f0f14; --fg:#f4f4f7; --muted:#a4a4b5; --card:#16161f; --twitch:#6441a5; --line:#2a2a36; }
+    *{ box-sizing:border-box }
+    body{ margin:0; font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif; background:var(--bg); color:var(--fg); }
+    .wrap{ max-width:1100px; margin:28px auto; padding:0 18px; }
+    h1{ margin:0 0 14px }
+    .muted{ color:var(--muted) }
+    .top{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px }
+    .pill{
+      display:inline-flex; align-items:center; gap:8px; background:rgba(255,255,255,.06);
+      border:1px solid rgba(255,255,255,.12); padding:6px 10px; border-radius:999px; font-weight:700;
+    }
+    .coin{ width:14px; height:14px; border-radius:50%; display:inline-block;
+      background: radial-gradient(90% 90% at 30% 30%, #fff4a6 0%, #ffd94d 35%, #e0a300 60%, #b07b00 100%);
+      box-shadow: inset 0 0 0 1px rgba(0,0,0,.25), 0 1px 4px rgba(0,0,0,.35);
+    }
+    .grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px }
+    @media (max-width:900px){ .grid{ grid-template-columns:repeat(2,1fr) } }
+    @media (max-width:560px){ .grid{ grid-template-columns:1fr } }
+    .card{ background:var(--card); border:1px solid rgba(255,255,255,.08); border-radius:14px; overflow:hidden; display:flex; flex-direction:column; }
+    .thumb{ aspect-ratio:2/3; display:flex; align-items:center; justify-content:center; background:#0b0b10; }
+    .thumb img{ width:100%; height:100%; object-fit:contain }
+    .info{ padding:12px; border-top:1px solid rgba(255,255,255,.06); display:flex; flex-direction:column; gap:8px }
+    .row{ display:flex; align-items:center; justify-content:space-between; gap:10px }
+    .btn{ appearance:none; border:0; border-radius:10px; padding:10px 12px; background:var(--twitch); color:#fff; font-weight:800; cursor:pointer }
+    .tag{ font-size:12px; color:#cfd0ff; background:rgba(100,65,165,.25); padding:4px 8px; border-radius:8px; border:1px solid rgba(100,65,165,.5) }
+    .toast{ position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:#121219; color:#fff; border:1px solid rgba(255,255,255,.16); padding:10px 12px; border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.4); display:none; }
+    .err{ color:#ff9a9a }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1>Shop</h1>
+        <div class="muted">Compra carte usando i tuoi punti.</div>
+      </div>
+      <div id="pill" class="pill" style="display:none">
+        <span id="uName">—</span>
+        <span class="coin" aria-hidden="true"></span>
+        <span id="uPts">0</span>
+      </div>
+    </div>
+
+    <div id="grid" class="grid"></div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    async function showToast(msg, ms=2000){ const t=document.getElementById('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none', ms); }
+
+    async function fetchMe(){
+      try{
+        const r=await fetch('/me', {credentials:'include'}); if(!r.ok) return null; return await r.json();
+      }catch(_){ return null; }
+    }
+    function setPill(me){
+      const pill=document.getElementById('pill');
+      if(!me){ pill.style.display='none'; return; }
+      document.getElementById('uName').textContent = me.username || 'Utente';
+      document.getElementById('uPts').textContent  = (typeof me.unspent_points==='number'?me.unspent_points:0);
+      pill.style.display='inline-flex';
+    }
+
+    async function loadItems(){
+      const grid=document.getElementById('grid');
+      grid.innerHTML = '<div class="muted">Caricamento…</div>';
+      const r = await fetch('/shop/items', {credentials:'include'}); const items = await r.json();
+      if(!Array.isArray(items) || !items.length){ grid.innerHTML='<div class="muted">Nessun articolo disponibile.</div>'; return; }
+      grid.innerHTML = '';
+      items.forEach(it=>{
+        const el=document.createElement('div');
+        el.className='card';
+        el.innerHTML = `
+          <div class="thumb"><img src="${it.image_url}" alt="${it.name}"></div>
+          <div class="info">
+            <div class="row"><strong>${it.name}</strong><span class="tag">${it.kind}</span></div>
+            <div class="row"><span class="muted">${it.description||''}</span><span><span class="coin"></span> ${it.cost_points}</span></div>
+            <div class="row"><button class="btn" data-id="${it.id}">Compra</button></div>
+          </div>
+        `;
+        grid.appendChild(el);
+      });
+
+      grid.addEventListener('click', async (e)=>{
+        const b = e.target.closest('button.btn'); if(!b) return;
+        const id = Number(b.dataset.id);
+        const qty = Number(prompt('Quanti pezzi?', '1') || '1');
+        if(!qty || qty<1) return;
+        b.disabled = true;
+        try{
+          const r = await fetch('/shop/purchase', {
+            method:'POST', credentials:'include',
+            headers:{ 'Content-Type':'application/json' },
+            body: JSON.stringify({ item_id:id, quantity:qty })
+          });
+          const j = await r.json();
+          if(!r.ok){ throw new Error(j.error || 'purchase_failed'); }
+          showToast('Acquisto riuscito!');
+          // aggiorna pill
+          const me = await fetchMe(); setPill(me);
+        }catch(err){
+          showToast('Errore acquisto: '+err.message, 2500);
+        }finally{
+          b.disabled=false;
+        }
+      });
+    }
+
+    (async function init(){
+      setPill(await fetchMe());
+      loadItems();
+    })();
+  </script>
+</body>
+</html>
