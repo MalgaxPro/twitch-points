@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Admin — No Udyr challenge</title>
+  <meta name="robots" content="noindex,nofollow" />
+  <style>
+    :root{
+      --twitch:#6441a5; --bg:#0f0f14; --card:#16161f; --text:#f4f4f7; --muted:#a4a4b5;
+      --line:#2a2a36; --accent:#8a6df9;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background: radial-gradient(1200px 800px at 10% -10%, #1d1540 0%, #0f0f14 50%) no-repeat, var(--bg);
+      color:var(--text);
+    }
+    header{
+      padding:18px 20px; border-bottom:1px solid rgba(255,255,255,.08);
+      background:
+        radial-gradient(800px 200px at 50% 0%, rgba(100,65,165,.25), rgba(0,0,0,0) 70%),
+        linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.0));
+    }
+    .head-inner{ max-width:1200px; margin:0 auto; display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    h1{ margin:0; font-size: clamp(20px, 2.6vw, 30px); font-weight:800; letter-spacing:.3px }
+    .actions{ display:flex; align-items:center; gap:10px; }
+    .btn{ appearance:none; border:0; cursor:pointer; user-select:none;
+      padding:9px 12px; border-radius:10px; font-weight:700; background:var(--twitch); color:#fff; }
+    .user-pill{
+      display:flex; align-items:center; gap:8px;
+      background:rgba(255,255,255,.06);
+      border:1px solid rgba(255,255,255,.12);
+      padding:6px 10px; border-radius:999px; font-weight:700; color:#e9e9ff;
+    }
+    main{ max-width:1200px; margin:18px auto; padding:0 20px; display:grid; gap:18px }
+    .card{ background:var(--card); border:1px solid rgba(255,255,255,.08); border-radius:16px; box-shadow:0 10px 28px rgba(0,0,0,.35); overflow:hidden }
+    .panel{ padding:14px 16px }
+    .panel-head{ display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid rgba(255,255,255,.08) }
+    .title{ margin:0; font-size:18px; font-weight:800 }
+    .muted{ color:var(--muted) }
+    .list{ width:100%; border-collapse:collapse }
+    .list th, .list td{ padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.06) }
+    .list th{ text-align:left; font-size:13px; color:#d6d6e8; letter-spacing:.2px }
+    .when{ color:#cfcff0; font-variant-numeric:tabular-nums }
+    .act{ text-align:right }
+    .btn-mini{ background:#232334; color:#fff; border:1px solid rgba(255,255,255,.15); border-radius:8px; padding:6px 10px; cursor:pointer; font-weight:700 }
+    .err{ color:#ffb4b4; margin:10px 0 }
+    .ok{ color:#a6ffc4; margin:10px 0 }
+    .guard{ background: rgba(255,80,80,.08); border:1px solid rgba(255,80,80,.25); color:#ffbebe; padding:14px; border-radius:12px }
+    /* login modal */
+    .modal-mask{display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9998}
+    .modal{position:fixed; inset:0; display:none; align-items:center; justify-content:center; z-index:9999}
+    .modal .box{ width:min(420px, 92%); background:#11131a; border:1px solid rgba(255,255,255,.06); border-radius:14px; padding:18px; color:#fff; text-align:center }
+    .modal .hint{ color:#a4a4b5; font-size:13px; margin-top:8px }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="head-inner">
+      <h1>🛡️ Admin — No Udyr challenge</h1>
+      <div class="actions">
+        <div id="userPill" class="user-pill" style="display:none"><span id="userName">—</span></div>
+        <button id="btnAuth" class="btn" type="button">Accedi</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div id="guard" class="guard" style="display:none">Accesso negato. Effettua l’accesso con l’account <strong>malgax</strong>.</div>
+
+    <div id="wrap" style="display:none">
+      <div class="card">
+        <div class="panel-head">
+          <h2 class="title">📜 Riscatti in sospeso</h2>
+          <div class="muted" id="lastRef">—</div>
+        </div>
+        <div class="panel">
+          <div id="msg" class=""></div>
+          <table class="list" aria-label="Riscatti carte in sospeso">
+            <thead>
+              <tr><th>Carta</th><th>Chi ha riscattato</th><th>Quando</th><th class="act">Azione</th></tr>
+            </thead>
+            <tbody id="rows"><tr><td colspan="4" class="muted">Caricamento…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Login popup -->
+  <div id="mask" class="modal-mask"></div>
+  <div id="modal" class="modal" aria-hidden="true" aria-modal="true" role="dialog">
+    <div class="box">
+      <div style="font-weight:700; margin-bottom:6px;">Accedi con Twitch</div>
+      <div class="muted">Si sta aprendo una finestra per l’accesso…<br/>Se il popup è bloccato, <a id="loginLink" href="https://api.malgax.com/auth/twitch" style="color:#9cb3ff">clicca qui</a>.</div>
+      <div class="hint">Al termine, questa finestra si chiuderà automaticamente.</div>
+    </div>
+  </div>
+
+  <script>
+    const API_ORIGIN="https://api.malgax.com";
+    const LOGIN_URL =API_ORIGIN+"/auth/twitch?popup=1";
+    const LOGOUT_URL=API_ORIGIN+"/logout?popup=1";
+    const ADMIN_USER = "malgax";
+    const ADMIN_TWITCH_ID = "26340883";
+
+    const guard = document.getElementById('guard');
+    const wrap  = document.getElementById('wrap');
+    const rows  = document.getElementById('rows');
+    const lastRef = document.getElementById('lastRef');
+    const msg = document.getElementById('msg');
+
+    const btnAuth=document.getElementById('btnAuth');
+    const mask=document.getElementById('mask');
+    const modal=document.getElementById('modal');
+    const loginLink=document.getElementById('loginLink');
+    const pill=document.getElementById('userPill');
+    const pillName=document.getElementById('userName');
+
+    let loggedIn=false, authWin=null, monitor=null;
+    const setUI=()=>btnAuth.textContent=loggedIn?'Logout':'Accedi';
+
+    function centerSpecs(w,h){
+      const l=window.screenLeft??screen.left, t=window.screenTop??screen.top;
+      const W=window.innerWidth||document.documentElement.clientWidth||screen.width;
+      const H=window.innerHeight||document.documentElement.clientHeight||screen.height;
+      return `scrollbars=yes,width=${w},height=${h},top=${t+Math.max(0,(H-h)/2)},left=${l+Math.max(0,(W-w)/2)}`;
+    }
+    function showModal(v){ mask.style.display=v?'block':'none'; modal.style.display=v?'flex':'none'; modal.setAttribute('aria-hidden',v?'false':'true'); }
+    function openPopup(url){
+      showModal(true);
+      authWin=window.open(url,'authPopup',centerSpecs(640,760));
+      if(!authWin||authWin.closed){ showModal(false); location.href=url.replace('?popup=1',''); return; }
+      monitor=setInterval(()=>{ if(authWin.closed){ clearInterval(monitor); showModal(false); } },300);
+    }
+
+    btnAuth.addEventListener('click',(e)=>{
+      e.preventDefault();
+      if(!loggedIn){ loginLink.href=LOGIN_URL; openPopup(LOGIN_URL); waitForLoginAndClose(); }
+      else{
+        openPopup(LOGOUT_URL);
+        const start=Date.now();
+        const wait=setInterval(()=>{
+          const closed=!authWin||authWin.closed;
+          if(closed||Date.now()-start>6000){
+            clearInterval(wait);
+            loggedIn=false; setUI(); pill.style.display='none'; showModal(false);
+            guard.style.display='block'; wrap.style.display='none';
+          }
+        },400);
+      }
+    });
+
+    async function fetchMe(){
+      try{
+        const r=await fetch(API_ORIGIN+'/me', {credentials:'include', cache:'no-store'});
+        if(!r.ok) return null;
+        return await r.json();
+      }catch(e){ return null; }
+    }
+    function isAdmin(me){
+      if(!me) return false;
+      const names = [me.username, me.user, me.twitch_username, me.login, me.display_name, me.displayName]
+                    .filter(Boolean).map(s=>String(s).toLowerCase().trim());
+      if(names.includes(ADMIN_USER)) return true;
+      const id = [me.twitch_id, me.id, me.user_id, me.twitchId].find(v=>v!==undefined && v!==null);
+      if(id && String(id)===ADMIN_TWITCH_ID) return true;
+      return false;
+    }
+    async function ensureAdminUI(){
+      const me = await fetchMe();
+      if(me){
+        loggedIn=true; setUI();
+        pill.style.display='flex';
+        pillName.textContent = me.username||me.user||me.twitch_username||me.display_name||me.login||'—';
+      }else{
+        loggedIn=false; setUI(); pill.style.display='none';
+      }
+
+      if(me && isAdmin(me)){
+        guard.style.display='none'; wrap.style.display='block';
+        loadList(); return;
+      }
+
+      // Fallback: lascia decidere al server (se l'endpoint non risponde 401/403, sei admin)
+      try{
+        const probe = await fetch(API_ORIGIN+'/admin/uses?status=pending', {credentials:'include'});
+        if(probe.ok){
+          guard.style.display='none'; wrap.style.display='block';
+          const data = await probe.json().catch(()=>[]);
+          renderRows(Array.isArray(data)?data:[]);
+          return;
+        }
+      }catch(_){}
+
+      guard.style.display='block'; wrap.style.display='none';
+    }
+
+    async function waitForLoginAndClose(timeoutMs=15000){
+      const start=Date.now();
+      while(Date.now()-start < timeoutMs){
+        const me = await fetchMe();
+        if(me){
+          try{ if(authWin && !authWin.closed) authWin.close(); }catch(e){}
+          showModal(false);
+          await ensureAdminUI();
+          return true;
+        }
+        await new Promise(r=>setTimeout(r,600));
+      }
+      showModal(false);
+      return false;
+    }
+
+    function renderRows(data){
+      if(!Array.isArray(data) || data.length===0){
+        rows.innerHTML = '<tr><td colspan="4" class="muted">Nessun riscatto in sospeso.</td></tr>';
+        lastRef.textContent = 'Aggiornato: ' + new Date().toLocaleTimeString();
+        return;
+      }
+      rows.innerHTML = '';
+      data.forEach((it)=>{
+        const tr=document.createElement('tr');
+        const when = new Date(it.used_at || it.created_at || Date.now());
+        tr.innerHTML = `
+          <td>${it.item_name || it.name || '—'}</td>
+          <td>${it.user_name || it.username || it.user || '—'}</td>
+          <td class="when">${when.toLocaleString()}</td>
+          <td class="act"><button class="btn-mini" data-id="${it.id}">Completato</button></td>
+        `;
+        rows.appendChild(tr);
+      });
+      rows.querySelectorAll('button.btn-mini').forEach(btn=>{
+        btn.addEventListener('click', async ()=>{
+          const id = btn.getAttribute('data-id');
+          btn.disabled=true;
+          try{
+            const r = await fetch(API_ORIGIN+'/admin/uses/'+encodeURIComponent(id)+'/complete', {
+              method:'PATCH', credentials:'include', headers:{'Content-Type':'application/json'}
+            });
+            if(!r.ok){
+              await fetch(API_ORIGIN+'/admin/uses/'+encodeURIComponent(id), {
+                method:'DELETE', credentials:'include'
+              });
+            }
+            btn.closest('tr').remove();
+            if(rows.children.length===0){
+              rows.innerHTML = '<tr><td colspan="4" class="muted">Nessun riscatto in sospeso.</td></tr>';
+            }
+            msg.textContent='Riscatto segnato come completato.'; msg.className='ok';
+          }catch(e){
+            msg.textContent='Errore nel completare il riscatto.'; msg.className='err';
+            btn.disabled=false;
+          }
+        });
+      });
+      lastRef.textContent = 'Aggiornato: ' + new Date().toLocaleTimeString();
+    }
+
+    async function loadList(){
+      rows.innerHTML = '<tr><td colspan="4" class="muted">Caricamento…</td></tr>';
+      msg.textContent=''; msg.className='';
+      try{
+        const r = await fetch(API_ORIGIN+'/admin/uses?status=pending', { credentials:'include', cache:'no-store' });
+        if(!r.ok){ throw new Error('unauthorized'); }
+        const data = await r.json();
+        renderRows(data);
+      }catch(e){
+        rows.innerHTML = '<tr><td colspan="4" class="muted">Errore di rete o permessi.</td></tr>';
+      }
+    }
+
+    setInterval(loadList, 45000);
+    ensureAdminUI();
+  </script>
+</body>
+</html>
