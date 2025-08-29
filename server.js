@@ -1,481 +1,576 @@
 // server.js
 require('dotenv').config();
+
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
-const session = require('express-session');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
+const session = require('express-session');
 const passport = require('passport');
 const TwitchStrategy = require('passport-twitch-new').Strategy;
 const { Pool } = require('pg');
 
-const {
-  PORT = 3000,
-  SESSION_SECRET = 'dev_secret_change_me',
-  TWITCH_CLIENT_ID,
-  TWITCH_CLIENT_SECRET,
-  TWITCH_CALLBACK_URL,       // es: https://api.malgax.com/auth/twitch/callback
-  TWITCH_EVENTSUB_SECRET,    // segreto per validare EventSub
-  DATABASE_URL               // stringa Neon
-} = process.env;
-
 const app = express();
+
+// ---------- Config ----------
+const PORT = process.env.PORT || 3000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+
+const ORIGINS = [
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'https://malgax.com',
+  'https://www.malgax.com',
+  'https://api.malgax.com',
+];
+
 app.set('trust proxy', 1);
-
-// --- CORS & session ---
 app.use(cors({
-  origin: ['https://www.malgax.com', 'https://malgax.com'],
-  credentials: true
+  origin: ORIGINS,
+  credentials: true,
 }));
-app.use(session({
-  secret: SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: { httpOnly: true, sameSite: 'none', secure: true, maxAge: 1000*60*60*24*30 }
-}));
+app.use(cookieParser());
 
-// --- PG ---
-const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+// JSON parser (attenzione: /eventsub usa raw body parser dedicato)
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// --- Passport ---
-passport.serializeUser((user, done) => done(null, { id: user.id, twitch_id: user.twitch_id, username: user.username }));
-passport.deserializeUser((obj, done) => done(null, obj));
+// ---------- DB (Neon / Postgres) ----------
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
-passport.use(new TwitchStrategy({
-  clientID: TWITCH_CLIENT_ID,
-  clientSecret: TWITCH_CLIENT_SECRET,
-  callbackURL: TWITCH_CALLBACK_URL,
-  scope: ['user:read:email', 'channel:read:subscriptions']
-}, async (accessToken, refreshToken, profile, done) => {
-  try {
-    const tid = String(profile.id);
-    const uname = profile.display_name || profile.username || profile.login || 'Utente';
-    const upsert = await pool.query(`
-      INSERT INTO users (twitch_id, username)
-      VALUES ($1, $2)
-      ON CONFLICT (twitch_id)
-      DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
-      RETURNING id, twitch_id, username, total_points, unspent_points
-    `, [tid, uname]);
-    done(null, upsert.rows[0]);
-  } catch (e) { done(e); }
-}));
-app.use(passport.initialize());
-app.use(passport.session());
-
-// --- DB init ---
-async function initDb() {
+// Crea tabelle se non esistono
+async function ensureTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
       twitch_id TEXT UNIQUE NOT NULL,
-      username TEXT,
+      username TEXT NOT NULL,
       total_points INTEGER NOT NULL DEFAULT 0,
       unspent_points INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tid ON users(twitch_id);
+  `);
 
-    CREATE TABLE IF NOT EXISTS items (
-      id SERIAL PRIMARY KEY,
-      slug TEXT UNIQUE NOT NULL,
-      name TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK (kind IN ('creature','spell','instant')),
-      cost_points INTEGER NOT NULL CHECK (cost_points > 0),
-      image_url TEXT NOT NULL,
-      description TEXT DEFAULT '',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS user_items (
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS point_transactions (
       id SERIAL PRIMARY KEY,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-      quantity INTEGER NOT NULL CHECK (quantity >= 0),
+      type TEXT NOT NULL, -- grant|spend
+      delta_points INTEGER NOT NULL,
+      points_before INTEGER NOT NULL,
+      points_after INTEGER NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_items (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      kind TEXT NOT NULL,          -- creature | spell | instant
+      cost_points INTEGER NOT NULL,
+      image_url TEXT NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT TRUE
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS inventory (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      item_id INTEGER NOT NULL REFERENCES shop_items(id) ON DELETE CASCADE,
+      quantity INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE(user_id, item_id)
     );
-
-    CREATE TABLE IF NOT EXISTS point_transactions (
-      id BIGSERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      type TEXT NOT NULL CHECK (type IN ('purchase','spend','grant','refund')),
-      delta_points INTEGER NOT NULL,
-      item_id INTEGER REFERENCES items(id),
-      quantity INTEGER,
-      client_token TEXT,
-      points_before INTEGER NOT NULL,
-      points_after  INTEGER NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    -- Anti-replay EventSub
-    CREATE TABLE IF NOT EXISTS eventsub_seen (
-      msg_id TEXT PRIMARY KEY,
-      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_eventsub_seen_time ON eventsub_seen(received_at);
   `);
 }
-initDb().catch(err => { console.error('DB init error:', err); process.exit(1); });
 
-// --- Helpers ---
-function requireAuth(req, res, next) {
-  if (req.isAuthenticated && req.isAuthenticated()) return next();
-  return res.status(401).json({ error: 'unauthorized' });
-}
+// ---------- Sessione & Passport ----------
+const sessionOpts = {
+  secret: process.env.SESSION_SECRET || 'change-me',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: NODE_ENV === 'production' ? 'none' : 'lax',
+    secure: NODE_ENV === 'production',
+    maxAge: 1000 * 60 * 60 * 24 * 30, // 30 giorni
+  },
+};
+app.use(session(sessionOpts));
+app.use(passport.initialize());
+app.use(passport.session());
 
-async function grantPointsByTwitchId(client, twitch_id, username, delta) {
-  const uRes = await client.query(`
-    INSERT INTO users (twitch_id, username)
-    VALUES ($1, $2)
-    ON CONFLICT (twitch_id)
-    DO UPDATE SET username = COALESCE(EXCLUDED.username, users.username), updated_at=NOW()
-    RETURNING id, total_points, unspent_points
-  `, [twitch_id, username || null]);
-  const u = uRes.rows[0];
-  const before = u.unspent_points;
-  const after  = u.unspent_points + delta;
+passport.serializeUser((user, done) => {
+  // salva solo l'id
+  done(null, user.id);
+});
 
-  await client.query('UPDATE users SET total_points = total_points + $1, unspent_points = unspent_points + $1, updated_at=NOW() WHERE id=$2', [delta, u.id]);
-  await client.query(`INSERT INTO point_transactions (user_id, type, delta_points, points_before, points_after) VALUES ($1,'grant',$2,$3,$4)`, [u.id, delta, before, after]);
-}
+passport.deserializeUser(async (id, done) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, twitch_id, username, total_points, unspent_points
+       FROM users WHERE id = $1`, [id]
+    );
+    if (rows.length) return done(null, rows[0]);
+    return done(null, false);
+  } catch (e) {
+    return done(e);
+  }
+});
 
-function secureEqual(a, b) {
-  const ba = Buffer.from(a || '');
-  const bb = Buffer.from(b || '');
-  if (ba.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ba, bb);
-}
-function computeSignature(secret, id, ts, raw) {
-  const hmac = crypto.createHmac('sha256', secret || '');
-  hmac.update(String(id || ''));
-  hmac.update(String(ts || ''));
-  hmac.update(String(raw || ''));
-  return 'sha256=' + hmac.digest('hex');
-}
-const EVENTSUB_TTL_SEC = 15 * 60;
+const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
+const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
+const TWITCH_CALLBACK_URL =
+  process.env.TWITCH_CALLBACK_URL ||
+  process.env.CALLBACK_URL || // compat vecchia
+  'http://localhost:3000/auth/twitch/callback';
 
-// --- Body parsers (cattura RAW per /eventsub) ---
-app.use(express.json({
-  verify: (req, res, buf) => {
-    if (req.originalUrl === '/eventsub') {
-      req.twitchRawBody = buf.toString('utf8');
-    }
+passport.use(new TwitchStrategy({
+  clientID: TWITCH_CLIENT_ID,
+  clientSecret: TWITCH_CLIENT_SECRET,
+  callbackURL: TWITCH_CALLBACK_URL,
+  scope: ['user:read:email', 'channel:read:subscriptions'],
+  passReqToCallback: true,
+}, async (req, accessToken, refreshToken, profile, done) => {
+  try {
+    const twitchId = profile.id;
+    const username = profile.display_name || profile.username || `user_${twitchId}`;
+
+    // Upsert utente
+    const up = await pool.query(`
+      INSERT INTO users (twitch_id, username)
+      VALUES ($1, $2)
+      ON CONFLICT (twitch_id)
+      DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
+      RETURNING id, twitch_id, username, total_points, unspent_points
+    `, [twitchId, username]);
+
+    return done(null, up.rows[0]);
+  } catch (e) {
+    return done(e);
   }
 }));
-app.use(express.urlencoded({ extended: true }));
 
-// --- OAuth ---
+// ---------- Auth Routes ----------
 app.get('/auth/twitch', (req, res, next) => {
-  const isPopup = req.query.popup === '1';
-  req.session.isPopup = isPopup;
-  const state = isPopup ? 'popup' : 'redir';
-  passport.authenticate('twitch', { state })(req, res, next);
+  // mantieni query popup=1
+  const opts = { state: 'login' };
+  passport.authenticate('twitch', opts)(req, res, next);
 });
 
 app.get('/auth/twitch/callback',
   passport.authenticate('twitch', { failureRedirect: '/auth-failed.html' }),
-  async (req, res) => {
-    req.session.isPopup = undefined;
-    res.type('html').send(`
-      <!doctype html><meta charset="utf-8"><title>Login effettuato</title>
-      <style>
-        body{margin:0;display:grid;place-items:center;height:100vh;background:#0f0f14;color:#e9e9f4;font:15px system-ui,Segoe UI,Roboto,Arial}
-        .box{background:#14141c;border:1px solid rgba(255,255,255,.15);border-radius:12px;padding:18px 20px;max-width:520px;text-align:center;box-shadow:0 10px 28px rgba(0,0,0,.45)}
-        .btn{margin-top:12px;padding:10px 14px;border-radius:10px;border:1px solid #444;background:#6441a5;color:#fff;font-weight:800;cursor:pointer}
-        .muted{color:#a4a4b5}
-      </style>
-      <div class="box">
-        <h2>✅ Login effettuato con successo</h2>
-        <p class="muted">Puoi chiudere questa finestra e tornare al sito.</p>
-        <button class="btn" onclick="tryClose()">Chiudi</button>
-      </div>
-      <script>
-        (function(){
-          function notify(){
-            try{ if(window.opener) window.opener.postMessage({type:'login'}, '*'); }catch(e){}
-            try{ if(window.parent && window.parent!==window) window.parent.postMessage({type:'login'}, '*'); }catch(e){}
-          }
-          window.tryClose = function(){
-            notify(); try{ window.open('','_self'); }catch(e){}; try{ window.close(); }catch(e){}
-          }
-          notify(); setTimeout(tryClose, 120); setTimeout(tryClose, 400); setTimeout(tryClose, 900);
-        })();
-      </script>
-    `);
-  }
-);
-
-app.get('/logout', (req, res, next) => {
-  const isPopup = req.query.popup === '1' || req.session.isPopup === true;
-  req.session.isPopup = undefined;
-  req.logout(err => {
-    if (err) return next(err);
-    req.session.destroy(() => {
-      if (isPopup) {
-        res.type('html').send(`
-          <!doctype html><meta charset="utf-8"><title>Logout</title>
-          <style>
-            body{margin:0;display:grid;place-items:center;height:100vh;background:#0f0f14;color:#e9e9f4;font:15px system-ui,Segoe UI,Roboto,Arial}
-            .box{background:#14141c;border:1px solid rgba(255,255,255,.15);border-radius:12px;padding:18px 20px;max-width:520px;text-align:center;box-shadow:0 10px 28px rgba(0,0,0,.45)}
-            .btn{margin-top:12px;padding:10px 14px;border-radius:10px;border:1px solid #444;background:#6441a5;color:#fff;font-weight:800;cursor:pointer}
-            .muted{color:#a4a4b5}
-          </style>
-          <div class="box"><h2>👋 Logout eseguito</h2><p class="muted">Puoi chiudere questa finestra.</p><button class="btn" onclick="tryClose()">Chiudi</button></div>
-          <script>
-            (function(){
-              function notify(){
-                try{ if(window.opener) window.opener.postMessage({type:'logout'}, '*'); }catch(e){}
-                try{ if(window.parent && window.parent!==window) window.parent.postMessage({type:'logout'}, '*'); }catch(e){}
-              }
-              window.tryClose = function(){
-                notify(); try{ window.open('','_self'); }catch(e){}; try{ window.close(); }catch(e){}
-              }
-              notify(); setTimeout(tryClose, 120); setTimeout(tryClose, 400); setTimeout(tryClose, 900);
-            })();
-          </script>
-        `);
-      } else {
-        res.type('text').send('Logout eseguito. Puoi chiudere questa pagina.');
-      }
-    });
-  });
-});
-
-// --- API base ---
-app.get('/me', async (req, res) => {
-  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+  (req, res) => {
+    // popup-friendly: chiudi e notifica opener
+    const origin = (req.headers.referer && new URL(req.headers.referer).origin) || '*';
+    res.status(200).type('html').send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Login OK</title></head>
+<body style="background:#0f0f14;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh">
+<div>✅ Login effettuato. Puoi chiudere questa finestra.</div>
+<script>
   try {
-    const { rows } = await pool.query('SELECT id, twitch_id, username, total_points, unspent_points FROM users WHERE id=$1', [req.user.id]);
-    if (!rows[0]) return res.status(404).json({ error: 'not_found' });
-    res.json(rows[0]);
-  } catch (e) { res.status(500).json({ error: 'server_error' }); }
-});
-app.get('/health', (req, res) => res.type('text').send('ok'));
-
-// --- Leaderboard ---
-app.get('/api/leaderboard', async (req, res) => {
-  const by = (req.query.by === 'unspent') ? 'unspent_points' : 'total_points';
-  try {
-    const { rows } = await pool.query(`SELECT username, ${by} AS points FROM users ORDER BY ${by} DESC, username ASC LIMIT 100`);
-    res.json(rows);
-  } catch (e) { res.status(500).json({ error: 'server_error' }); }
-});
-app.get('/api/leaderboard/top', (req, res) =>
-  pool.query(`SELECT username, total_points AS points FROM users ORDER BY total_points DESC, username ASC LIMIT 100`)
-    .then(r => res.json(r.rows)).catch(_ => res.status(500).json({ error: 'server_error' }))
-);
-app.get('/api/leaderboard/unspent', (req, res) =>
-  pool.query(`SELECT username, unspent_points AS points FROM users ORDER BY unspent_points DESC, username ASC LIMIT 100`)
-    .then(r => res.json(r.rows)).catch(_ => res.status(500).json({ error: 'server_error' }))
-);
-
-// --- SHOP ---
-app.get('/shop/items', async (req, res) => {
-  try{
-    const { rows } = await pool.query(
-      `SELECT id, slug, name, kind, cost_points, image_url, description
-       FROM items
-       ORDER BY cost_points ASC, name ASC`
-    );
-    res.json(rows);
-  }catch(e){
-    res.status(500).json({ error:'server_error' });
-  }
-});
-app.post('/shop/purchase', requireAuth, async (req, res) => {
-  const itemId = parseInt(req.body.item_id, 10);
-  const qty    = Math.max(1, parseInt(req.body.quantity || '1', 10));
-  const idem   = (req.headers['idempotency-key'] || '').toString().slice(0,128);
-  if (!Number.isFinite(itemId) || itemId <= 0) return res.status(400).json({ error: 'item_id non valido' });
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const uRes = await client.query('SELECT id, unspent_points FROM users WHERE id=$1 FOR UPDATE', [req.user.id]);
-    if (!uRes.rows[0]) throw new Error('utente non trovato');
-    const user = uRes.rows[0];
-
-    const iRes = await client.query('SELECT id, name, cost_points FROM items WHERE id=$1', [itemId]);
-    if (!iRes.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'item non trovato' }); }
-    const item = iRes.rows[0];
-
-    const totalCost = item.cost_points * qty;
-    if (user.unspent_points < totalCost) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'punti insufficienti' }); }
-
-    await client.query(`
-      INSERT INTO user_items (user_id, item_id, quantity)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (user_id, item_id)
-      DO UPDATE SET quantity = user_items.quantity + EXCLUDED.quantity
-    `, [req.user.id, item.id, qty]);
-
-    const after = user.unspent_points - totalCost;
-    await client.query('UPDATE users SET unspent_points=$1, updated_at=NOW() WHERE id=$2', [after, req.user.id]);
-
-    await client.query(`
-      INSERT INTO point_transactions
-        (user_id, type, delta_points, item_id, quantity, client_token, points_before, points_after)
-      VALUES ($1, 'purchase', $2, $3, $4, NULLIF($5,''), $6, $7)
-    `, [req.user.id, -totalCost, item.id, qty, idem, user.unspent_points, after]);
-
-    await client.query('COMMIT');
-    res.json({ ok: true, item: { id: item.id, name: item.name, cost_points: item.cost_points }, quantity: qty, cost: totalCost, unspent_after: after });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: 'purchase_failed', detail: e.message });
-  } finally { client.release(); }
-});
-
-// --- INVENTORY ---
-app.get('/inventory', requireAuth, async (req, res) => {
-  const { rows } = await pool.query(`
-    SELECT i.id AS item_id, i.slug, i.name, i.kind, i.image_url, i.description, ui.quantity
-    FROM user_items ui
-    JOIN items i ON i.id = ui.item_id
-    WHERE ui.user_id = $1
-    ORDER BY i.kind, i.name
-  `, [req.user.id]);
-  res.json(rows);
-});
-app.post('/inventory/use', requireAuth, async (req, res) => {
-  const itemId = parseInt(req.body.item_id, 10);
-  const qty = Math.max(1, parseInt(req.body.quantity || '1', 10));
-  if (!Number.isFinite(itemId) || itemId <= 0) return res.status(400).json({ error: 'item_id non valido' });
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const qRes = await client.query('SELECT quantity FROM user_items WHERE user_id=$1 AND item_id=$2 FOR UPDATE', [req.user.id, itemId]);
-    const have = qRes.rows[0]?.quantity || 0;
-    if (have < qty) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'quantità insufficiente' }); }
-
-    await client.query('UPDATE user_items SET quantity = quantity - $1 WHERE user_id=$2 AND item_id=$3', [qty, req.user.id, itemId]);
-
-    await client.query(`
-      INSERT INTO point_transactions (user_id, type, delta_points, item_id, quantity, points_before, points_after)
-      VALUES ($1, 'spend', 0, $2, $3,
-        (SELECT unspent_points FROM users WHERE id=$1),
-        (SELECT unspent_points FROM users WHERE id=$1))
-    `, [req.user.id, itemId, qty]);
-
-    await client.query('COMMIT');
-    res.json({ ok: true });
-  } catch (e) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: 'use_failed', detail: e.message });
-  } finally { client.release(); }
-});
-
-// --- EVENTSUB ---
-// Usiamo il RAW salvato da express.json({verify}) in req.twitchRawBody
-app.post('/eventsub', async (req, res) => {
-  const raw = (typeof req.twitchRawBody === 'string') ? req.twitchRawBody : '';
-  const type = req.header('Twitch-Eventsub-Message-Type') || '';
-  const id   = req.header('Twitch-Eventsub-Message-Id') || '';
-  const ts   = req.header('Twitch-Eventsub-Message-Timestamp') || '';
-  const sigH = req.header('Twitch-Eventsub-Message-Signature') || '';
-
-  // handshake (challenge)
-  if (type === 'webhook_callback_verification') {
-    try {
-      const payload = JSON.parse(raw || '{}');
-      return res.status(200).type('text/plain').send(payload.challenge);
-    } catch { return res.status(400).send('bad_request'); }
-  }
-
-  // verifica firma per notifiche/revoche
-  const computed = computeSignature(TWITCH_EVENTSUB_SECRET, id, ts, raw);
-  if (!secureEqual(computed, sigH)) {
-    return res.status(403).type('text/plain').send('Invalid signature');
-  }
-
-  // anti-replay: scarta messaggi troppo vecchi
-  const now = Date.now();
-  const tsMs = Date.parse(ts);
-  if (Number.isFinite(tsMs)) {
-    const ageSec = Math.abs(now - tsMs) / 1000;
-    if (ageSec > EVENTSUB_TTL_SEC) {
-      return res.status(200).type('text/plain').send('stale');
+    if (window.opener) {
+      window.opener.postMessage({ type: 'login' }, '${origin}');
+      window.close();
     }
+  } catch(_) {}
+</script>
+</body></html>`);
   }
+);
 
-  let payload = null;
-  try { payload = JSON.parse(raw || '{}'); } catch { return res.status(400).send('bad_json'); }
+app.get('/logout', (req, res) => {
+  const origin = (req.headers.referer && new URL(req.headers.referer).origin) || '*';
+  const doSend = () => {
+    res.status(200).type('html').send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Logout</title></head>
+<body style="background:#0f0f14;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh">
+<div>👋 Logout eseguito. Puoi chiudere questa finestra.</div>
+<script>
+  try {
+    if (window.opener) {
+      window.opener.postMessage({ type: 'logout' }, '${origin}');
+      window.close();
+    }
+  } catch(_) {}
+</script>
+</body></html>`);
+  };
 
-  if (type === 'revocation') {
-    // puoi loggare/sub-notify qui
-    return res.status(200).type('text/plain').send('ok');
+  // Passport 0.6 logout è async
+  if (req.logout) {
+    req.logout(function () {
+      req.session?.destroy(()=> doSend());
+    });
+  } else {
+    req.session?.destroy(()=> doSend());
   }
+});
 
-  if (type === 'notification') {
-    const subType = payload.subscription?.type;
-    const ev = payload.event || {};
+// Utente corrente
+app.get('/me', (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+  res.json(req.user);
+});
 
+// ---------- Leaderboard ----------
+app.get('/api/leaderboard/top', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT username, total_points AS points
+      FROM users
+      WHERE total_points > 0
+      ORDER BY total_points DESC, username ASC
+      LIMIT 100
+    `);
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get('/api/leaderboard/unspent', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT username, unspent_points AS points
+      FROM users
+      WHERE unspent_points > 0
+      ORDER BY unspent_points DESC, username ASC
+      LIMIT 100
+    `);
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// ---------- Shop ----------
+app.get('/shop/items', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, name, kind, cost_points, image_url
+      FROM shop_items
+      WHERE active = TRUE
+      ORDER BY id ASC
+    `);
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/shop/purchase', async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+  const userId = req.user.id;
+  const { item_id, quantity } = req.body;
+  const qty = Math.max(1, Number(quantity || 1));
+
+  try {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      // prova a registrare msg_id: se già visto → esci senza processare
-      const ins = await client.query(
-        `INSERT INTO eventsub_seen (msg_id, received_at)
-         VALUES ($1, NOW())
-         ON CONFLICT (msg_id) DO NOTHING
-         RETURNING msg_id`, [id]
+      // prendi item
+      const it = await client.query(
+        `SELECT id, name, cost_points FROM shop_items WHERE id = $1 AND active = TRUE`,
+        [item_id]
       );
-      if (ins.rowCount === 0) {
-        await client.query('COMMIT');
-        client.release();
-        return res.status(200).type('text/plain').send('duplicate');
+      if (it.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'item_not_found' });
+      }
+      const item = it.rows[0];
+      const totalCost = item.cost_points * qty;
+
+      // blocca utente
+      const u = await client.query(
+        `SELECT id, unspent_points FROM users WHERE id = $1 FOR UPDATE`,
+        [userId]
+      );
+      if (u.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'user_not_found' });
+      }
+      const beforePts = Number(u.rows[0].unspent_points) || 0;
+      if (beforePts < totalCost) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'insufficient_points' });
       }
 
-      // pulizia vecchi record (best-effort)
-      await client.query(`DELETE FROM eventsub_seen WHERE received_at < NOW() - INTERVAL '2 days'`);
+      // scala punti
+      const u2 = await client.query(
+        `UPDATE users
+           SET unspent_points = unspent_points - $2,
+               updated_at = NOW()
+         WHERE id = $1
+         RETURNING unspent_points`,
+        [userId, totalCost]
+      );
+      const afterPts = Number(u2.rows[0].unspent_points) || 0;
 
-      if (subType === 'channel.subscribe') {
-        const twitch_id = String(ev.user_id || '');
-        const username = ev.user_name || ev.user_login || null;
-        if (twitch_id) await grantPointsByTwitchId(client, twitch_id, username, 1);
-      } else if (subType === 'channel.subscription.gift') {
-        const isAnon = !!ev.is_anonymous;
-        if (!isAnon) {
-          const twitch_id = String(ev.user_id || '');
-          const username = ev.user_name || ev.user_login || null;
-          const n = Number(ev.total) > 0 ? Number(ev.total) : 1;
-          if (twitch_id) await grantPointsByTwitchId(client, twitch_id, username, n);
-        }
-      }
+      // upsert inventory
+      await client.query(
+        `INSERT INTO inventory (user_id, item_id, quantity)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (user_id, item_id)
+         DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity,
+                       updated_at = NOW()`,
+        [userId, item_id, qty]
+      );
+
+      // log transazione spend
+      await client.query(
+        `INSERT INTO point_transactions (user_id, type, delta_points, points_before, points_after)
+         VALUES ($1, 'spend', $2, $3, $4)`,
+        [userId, -totalCost, beforePts, afterPts]
+      );
 
       await client.query('COMMIT');
-      client.release();
+      res.json({ ok: true, unspent_after: afterPts });
     } catch (e) {
-      try { await pool.query('ROLLBACK'); } catch(_) {}
-      console.error('EventSub handler error:', e);
+      await client.query('ROLLBACK');
+      console.error(e);
+      res.status(500).json({ error: 'server_error' });
+    } finally {
+      client.release();
     }
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'server_error' });
   }
-
-  res.status(200).type('text/plain').send('ok');
 });
 
-// --- Debug routes ---
-app.get('/_routes', (req, res) => {
-  const list = (app._router.stack || [])
-    .filter(l => l.route && l.route.path)
-    .map(l => {
-      const methods = Object.keys(l.route.methods).filter(Boolean).join(',').toUpperCase();
-      return `${methods} ${l.route.path}`;
-    })
-    .sort();
+// ---------- Inventory (FIX: niente quantity=0) ----------
+app.get('/inventory', async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+  const userId = req.user.id;
+  try {
+    const { rows } = await pool.query(
+      `SELECT i.item_id, i.quantity, s.name, s.image_url
+         FROM inventory i
+         JOIN shop_items s ON s.id = i.item_id
+        WHERE i.user_id = $1
+          AND i.quantity > 0
+        ORDER BY s.name ASC`,
+      [userId]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Usa 1 o più item; se la quantità scende a 0, elimina la riga
+app.post('/inventory/use', async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+  const userId = req.user.id;
+  const { item_id, quantity } = req.body;
+  const qty = Math.max(1, Number(quantity || 1));
+
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const cur = await client.query(
+        `SELECT id, quantity FROM inventory
+         WHERE user_id = $1 AND item_id = $2
+         FOR UPDATE`,
+        [userId, item_id]
+      );
+      if (cur.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'not_in_inventory' });
+      }
+      const invId = cur.rows[0].id;
+      const have = Number(cur.rows[0].quantity) || 0;
+      if (have < qty) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'not_enough_quantity' });
+      }
+
+      const remaining = have - qty;
+      if (remaining <= 0) {
+        // elimina riga
+        await client.query(`DELETE FROM inventory WHERE id = $1`, [invId]);
+        await client.query('COMMIT');
+        return res.json({ ok: true, remaining: 0, deleted: true });
+      } else {
+        // aggiorna quantità
+        await client.query(
+          `UPDATE inventory
+             SET quantity = $2,
+                 updated_at = NOW()
+           WHERE id = $1`,
+          [invId, remaining]
+        );
+        await client.query('COMMIT');
+        return res.json({ ok: true, remaining });
+      }
+    } catch (e) {
+      await client.query('ROLLBACK');
+      console.error(e);
+      return res.status(500).json({ error: 'server_error' });
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// ---------- EventSub (raw body + firma) ----------
+const EVENTSUB_SECRET = process.env.TWITCH_EVENTSUB_SECRET || 'set-me';
+
+function timingSafeEqual(a, b) {
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+// usa raw body SOLO per questa rotta
+app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const messageId = req.get('Twitch-Eventsub-Message-Id') || '';
+    const timestamp = req.get('Twitch-Eventsub-Message-Timestamp') || '';
+    const signature = req.get('Twitch-Eventsub-Message-Signature') || '';
+    const messageType = req.get('Twitch-Eventsub-Message-Type') || '';
+    const rawBody = req.body instanceof Buffer ? req.body.toString('utf8') : String(req.body || '');
+    const expected = 'sha256=' + crypto.createHmac('sha256', EVENTSUB_SECRET).update(messageId + timestamp + rawBody).digest('hex');
+
+    if (!timingSafeEqual(signature, expected)) {
+      return res.status(403).type('text/plain').send('Invalid signature');
+    }
+
+    const payload = rawBody ? JSON.parse(rawBody) : {};
+    if (messageType === 'webhook_callback_verification') {
+      // handshake iniziale
+      return res.status(200).type('text/plain').send(payload.challenge);
+    }
+
+    if (messageType === 'notification') {
+      const subType = payload.subscription?.type;
+      const ev = payload.event || {};
+
+      if (subType === 'channel.subscribe') {
+        // +1 punto al subscriber
+        const twitchId = ev.user_id; // chi si è abbonato
+        const username = ev.user_login || ev.user_name || ('user_'+twitchId);
+        await grantPointsToTwitchUser(twitchId, username, 1);
+      }
+
+      if (subType === 'channel.subscription.gift') {
+        // +N punti al gifter (total può essere >1)
+        const twitchId = ev.user_id; // chi regala
+        const username = ev.user_login || ev.user_name || ('user_'+twitchId);
+        const n = Number(ev.total) || 1;
+        await grantPointsToTwitchUser(twitchId, username, n);
+      }
+
+      return res.status(200).json({ ok: true });
+    }
+
+    // default
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('eventsub error:', e);
+    return res.status(500).type('text/plain').send('server_error');
+  }
+});
+
+// assegna punti (total + unspent) e logga transazione
+async function grantPointsToTwitchUser(twitchId, username, delta) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // upsert utente
+    const up = await client.query(`
+      INSERT INTO users (twitch_id, username)
+      VALUES ($1, $2)
+      ON CONFLICT (twitch_id)
+      DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
+      RETURNING id, total_points, unspent_points
+    `, [twitchId, username]);
+
+    const userId = up.rows[0].id;
+    const before = Number(up.rows[0].unspent_points) || 0;
+
+    const upd = await client.query(`
+      UPDATE users
+         SET total_points   = total_points + $2,
+             unspent_points = unspent_points + $2,
+             updated_at     = NOW()
+       WHERE id = $1
+       RETURNING unspent_points
+    `, [userId, delta]);
+
+    const after = Number(upd.rows[0].unspent_points) || (before + delta);
+
+    await client.query(`
+      INSERT INTO point_transactions (user_id, type, delta_points, points_before, points_after)
+      VALUES ($1, 'grant', $2, $3, $4)
+    `, [userId, delta, before, after]);
+
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('grantPoints error:', e);
+  } finally {
+    client.release();
+  }
+}
+
+// ---------- Utils ----------
+app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/_routes', (_req, res) => {
+  const list = [];
+  const stack = app._router && app._router.stack || [];
+  stack.forEach((m) => {
+    if (m.route && m.route.path) {
+      const methods = Object.keys(m.route.methods).filter(k => m.route.methods[k]).map(k => k.toUpperCase());
+      list.push({ path: m.route.path, methods });
+    } else if (m.name === 'router' && m.handle && m.handle.stack) {
+      m.handle.stack.forEach((h) => {
+        if (h.route && h.route.path) {
+          const methods = Object.keys(h.route.methods).filter(k => h.route.methods[k]).map(k => k.toUpperCase());
+          list.push({ path: h.route.path, methods });
+        }
+      });
+    }
+  });
   res.json(list);
 });
 
-// --- Static ---
-app.use(express.static(path.join(__dirname, 'public')));
+// ---------- Static ----------
+app.use(express.static(path.join(__dirname, 'public'), { index: 'index.html', extensions: ['html'] }));
 
-// --- Start ---
-app.listen(PORT, () => {
-  console.log(`Server avviato su http://localhost:${PORT}`);
-});
+// Alias comodi per leaderboard (se servono)
+app.get('/leaderboard/top', (_req, res) => res.redirect(301, '/api/leaderboard/top'));
+app.get('/leaderboard/unspent', (_req, res) => res.redirect(301, '/api/leaderboard/unspent'));
+app.get('/leaderboard', (_req, res) => res.redirect(301, '/leaderboard.html'));
+
+// ---------- Start ----------
+ensureTables()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server avviato su http://localhost:${PORT}.`);
+    });
+  })
+  .catch((e) => {
+    console.error('DB init error:', e);
+    process.exit(1);
+  });
