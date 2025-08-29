@@ -108,6 +108,13 @@ async function initDb() {
       points_after  INTEGER NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    -- Anti-replay EventSub
+    CREATE TABLE IF NOT EXISTS eventsub_seen (
+      msg_id TEXT PRIMARY KEY,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_eventsub_seen_time ON eventsub_seen(received_at);
   `);
 }
 initDb().catch(err => { console.error('DB init error:', err); process.exit(1); });
@@ -147,13 +154,12 @@ function computeSignature(secret, id, ts, raw) {
   hmac.update(String(raw || ''));
   return 'sha256=' + hmac.digest('hex');
 }
+const EVENTSUB_TTL_SEC = 15 * 60;
 
-// --- Body parsers (con cattura RAW per /eventsub) ---
-// NB: mettiamo express.json DOPO aver definito la cattura del raw body
+// --- Body parsers (cattura RAW per /eventsub) ---
 app.use(express.json({
   verify: (req, res, buf) => {
     if (req.originalUrl === '/eventsub') {
-      // salviamo il raw body così come arrivato
       req.twitchRawBody = buf.toString('utf8');
     }
   }
@@ -373,7 +379,7 @@ app.post('/eventsub', async (req, res) => {
   const ts   = req.header('Twitch-Eventsub-Message-Timestamp') || '';
   const sigH = req.header('Twitch-Eventsub-Message-Signature') || '';
 
-  // handshake: rispondi col challenge (niente firma richiesta da Twitch in questa fase)
+  // handshake (challenge)
   if (type === 'webhook_callback_verification') {
     try {
       const payload = JSON.parse(raw || '{}');
@@ -381,21 +387,53 @@ app.post('/eventsub', async (req, res) => {
     } catch { return res.status(400).send('bad_request'); }
   }
 
-  // verifica firma per notifiche
+  // verifica firma per notifiche/revoche
   const computed = computeSignature(TWITCH_EVENTSUB_SECRET, id, ts, raw);
   if (!secureEqual(computed, sigH)) {
     return res.status(403).type('text/plain').send('Invalid signature');
   }
 
+  // anti-replay: scarta messaggi troppo vecchi
+  const now = Date.now();
+  const tsMs = Date.parse(ts);
+  if (Number.isFinite(tsMs)) {
+    const ageSec = Math.abs(now - tsMs) / 1000;
+    if (ageSec > EVENTSUB_TTL_SEC) {
+      return res.status(200).type('text/plain').send('stale');
+    }
+  }
+
   let payload = null;
   try { payload = JSON.parse(raw || '{}'); } catch { return res.status(400).send('bad_json'); }
+
+  if (type === 'revocation') {
+    // puoi loggare/sub-notify qui
+    return res.status(200).type('text/plain').send('ok');
+  }
 
   if (type === 'notification') {
     const subType = payload.subscription?.type;
     const ev = payload.event || {};
+
+    const client = await pool.connect();
     try {
-      const client = await pool.connect();
       await client.query('BEGIN');
+
+      // prova a registrare msg_id: se già visto → esci senza processare
+      const ins = await client.query(
+        `INSERT INTO eventsub_seen (msg_id, received_at)
+         VALUES ($1, NOW())
+         ON CONFLICT (msg_id) DO NOTHING
+         RETURNING msg_id`, [id]
+      );
+      if (ins.rowCount === 0) {
+        await client.query('COMMIT');
+        client.release();
+        return res.status(200).type('text/plain').send('duplicate');
+      }
+
+      // pulizia vecchi record (best-effort)
+      await client.query(`DELETE FROM eventsub_seen WHERE received_at < NOW() - INTERVAL '2 days'`);
 
       if (subType === 'channel.subscribe') {
         const twitch_id = String(ev.user_id || '');
@@ -413,7 +451,10 @@ app.post('/eventsub', async (req, res) => {
 
       await client.query('COMMIT');
       client.release();
-    } catch (e) { console.error('EventSub handler error:', e); }
+    } catch (e) {
+      try { await pool.query('ROLLBACK'); } catch(_) {}
+      console.error('EventSub handler error:', e);
+    }
   }
 
   res.status(200).type('text/plain').send('ok');
