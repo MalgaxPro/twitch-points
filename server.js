@@ -13,7 +13,6 @@ const { Pool } = require('pg');
 
 const app = express();
 
-// ---------- Config ----------
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
@@ -26,23 +25,17 @@ const ORIGINS = [
 ];
 
 app.set('trust proxy', 1);
-app.use(cors({
-  origin: ORIGINS,
-  credentials: true,
-}));
+app.use(cors({ origin: ORIGINS, credentials: true }));
 app.use(cookieParser());
 
-// JSON parser (attenzione: /eventsub usa raw body parser dedicato)
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ---------- DB (Neon / Postgres) ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// Crea tabelle se non esistono
 async function ensureTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -60,7 +53,7 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS point_transactions (
       id SERIAL PRIMARY KEY,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      type TEXT NOT NULL, -- grant|spend
+      type TEXT NOT NULL,
       delta_points INTEGER NOT NULL,
       points_before INTEGER NOT NULL,
       points_after INTEGER NOT NULL,
@@ -72,7 +65,7 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS shop_items (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
-      kind TEXT NOT NULL,          -- creature | spell | instant
+      kind TEXT NOT NULL,
       cost_points INTEGER NOT NULL,
       image_url TEXT NOT NULL,
       active BOOLEAN NOT NULL DEFAULT TRUE
@@ -92,7 +85,6 @@ async function ensureTables() {
   `);
 }
 
-// ---------- Sessione & Passport ----------
 const sessionOpts = {
   secret: process.env.SESSION_SECRET || 'change-me',
   resave: false,
@@ -101,23 +93,19 @@ const sessionOpts = {
     httpOnly: true,
     sameSite: NODE_ENV === 'production' ? 'none' : 'lax',
     secure: NODE_ENV === 'production',
-    maxAge: 1000 * 60 * 60 * 24 * 30, // 30 giorni
+    maxAge: 1000 * 60 * 60 * 24 * 30,
   },
 };
 app.use(session(sessionOpts));
 app.use(passport.initialize());
 app.use(passport.session());
 
-passport.serializeUser((user, done) => {
-  // salva solo l'id
-  done(null, user.id);
-});
-
+passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser(async (id, done) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, twitch_id, username, total_points, unspent_points
-       FROM users WHERE id = $1`, [id]
+      `SELECT id, twitch_id, username, total_points, unspent_points FROM users WHERE id = $1`,
+      [id]
     );
     if (rows.length) return done(null, rows[0]);
     return done(null, false);
@@ -130,7 +118,7 @@ const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
 const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
 const TWITCH_CALLBACK_URL =
   process.env.TWITCH_CALLBACK_URL ||
-  process.env.CALLBACK_URL || // compat vecchia
+  process.env.CALLBACK_URL ||
   'http://localhost:3000/auth/twitch/callback';
 
 passport.use(new TwitchStrategy({
@@ -143,8 +131,6 @@ passport.use(new TwitchStrategy({
   try {
     const twitchId = profile.id;
     const username = profile.display_name || profile.username || `user_${twitchId}`;
-
-    // Upsert utente
     const up = await pool.query(`
       INSERT INTO users (twitch_id, username)
       VALUES ($1, $2)
@@ -152,36 +138,26 @@ passport.use(new TwitchStrategy({
       DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
       RETURNING id, twitch_id, username, total_points, unspent_points
     `, [twitchId, username]);
-
     return done(null, up.rows[0]);
   } catch (e) {
     return done(e);
   }
 }));
 
-// ---------- Auth Routes ----------
 app.get('/auth/twitch', (req, res, next) => {
-  // mantieni query popup=1
-  const opts = { state: 'login' };
-  passport.authenticate('twitch', opts)(req, res, next);
+  passport.authenticate('twitch', { state: 'login' })(req, res, next);
 });
 
 app.get('/auth/twitch/callback',
   passport.authenticate('twitch', { failureRedirect: '/auth-failed.html' }),
   (req, res) => {
-    // popup-friendly: chiudi e notifica opener
     const origin = (req.headers.referer && new URL(req.headers.referer).origin) || '*';
     res.status(200).type('html').send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Login OK</title></head>
 <body style="background:#0f0f14;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh">
 <div>✅ Login effettuato. Puoi chiudere questa finestra.</div>
 <script>
-  try {
-    if (window.opener) {
-      window.opener.postMessage({ type: 'login' }, '${origin}');
-      window.close();
-    }
-  } catch(_) {}
+  try { if (window.opener) { window.opener.postMessage({ type: 'login' }, '${origin}'); window.close(); } } catch(_) {}
 </script>
 </body></html>`);
   }
@@ -189,39 +165,25 @@ app.get('/auth/twitch/callback',
 
 app.get('/logout', (req, res) => {
   const origin = (req.headers.referer && new URL(req.headers.referer).origin) || '*';
-  const doSend = () => {
+  const send = () => {
     res.status(200).type('html').send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Logout</title></head>
 <body style="background:#0f0f14;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh">
 <div>👋 Logout eseguito. Puoi chiudere questa finestra.</div>
 <script>
-  try {
-    if (window.opener) {
-      window.opener.postMessage({ type: 'logout' }, '${origin}');
-      window.close();
-    }
-  } catch(_) {}
+  try { if (window.opener) { window.opener.postMessage({ type: 'logout' }, '${origin}'); window.close(); } } catch(_) {}
 </script>
 </body></html>`);
   };
-
-  // Passport 0.6 logout è async
-  if (req.logout) {
-    req.logout(function () {
-      req.session?.destroy(()=> doSend());
-    });
-  } else {
-    req.session?.destroy(()=> doSend());
-  }
+  if (req.logout) { req.logout(() => req.session?.destroy(()=> send())); }
+  else { req.session?.destroy(()=> send()); }
 });
 
-// Utente corrente
 app.get('/me', (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'unauthorized' });
   res.json(req.user);
 });
 
-// ---------- Leaderboard ----------
 app.get('/api/leaderboard/top', async (_req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -233,8 +195,7 @@ app.get('/api/leaderboard/top', async (_req, res) => {
     `);
     res.json(rows);
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'server_error' });
+    console.error(e); res.status(500).json({ error: 'server_error' });
   }
 });
 
@@ -249,12 +210,10 @@ app.get('/api/leaderboard/unspent', async (_req, res) => {
     `);
     res.json(rows);
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'server_error' });
+    console.error(e); res.status(500).json({ error: 'server_error' });
   }
 });
 
-// ---------- Shop ----------
 app.get('/shop/items', async (_req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -265,8 +224,7 @@ app.get('/shop/items', async (_req, res) => {
     `);
     res.json(rows);
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'server_error' });
+    console.error(e); res.status(500).json({ error: 'server_error' });
   }
 });
 
@@ -281,34 +239,22 @@ app.post('/shop/purchase', async (req, res) => {
     try {
       await client.query('BEGIN');
 
-      // prendi item
       const it = await client.query(
         `SELECT id, name, cost_points FROM shop_items WHERE id = $1 AND active = TRUE`,
         [item_id]
       );
-      if (it.rowCount === 0) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'item_not_found' });
-      }
+      if (it.rowCount === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'item_not_found' }); }
       const item = it.rows[0];
       const totalCost = item.cost_points * qty;
 
-      // blocca utente
       const u = await client.query(
         `SELECT id, unspent_points FROM users WHERE id = $1 FOR UPDATE`,
         [userId]
       );
-      if (u.rowCount === 0) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'user_not_found' });
-      }
+      if (u.rowCount === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'user_not_found' }); }
       const beforePts = Number(u.rows[0].unspent_points) || 0;
-      if (beforePts < totalCost) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'insufficient_points' });
-      }
+      if (beforePts < totalCost) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'insufficient_points' }); }
 
-      // scala punti
       const u2 = await client.query(
         `UPDATE users
            SET unspent_points = unspent_points - $2,
@@ -319,7 +265,6 @@ app.post('/shop/purchase', async (req, res) => {
       );
       const afterPts = Number(u2.rows[0].unspent_points) || 0;
 
-      // upsert inventory
       await client.query(
         `INSERT INTO inventory (user_id, item_id, quantity)
          VALUES ($1, $2, $3)
@@ -329,7 +274,6 @@ app.post('/shop/purchase', async (req, res) => {
         [userId, item_id, qty]
       );
 
-      // log transazione spend
       await client.query(
         `INSERT INTO point_transactions (user_id, type, delta_points, points_before, points_after)
          VALUES ($1, 'spend', $2, $3, $4)`,
@@ -339,19 +283,16 @@ app.post('/shop/purchase', async (req, res) => {
       await client.query('COMMIT');
       res.json({ ok: true, unspent_after: afterPts });
     } catch (e) {
-      await client.query('ROLLBACK');
-      console.error(e);
-      res.status(500).json({ error: 'server_error' });
+      await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'server_error' });
     } finally {
       client.release();
     }
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'server_error' });
+    console.error(e); res.status(500).json({ error: 'server_error' });
   }
 });
 
-// ---------- Inventory (FIX: niente quantity=0) ----------
+// INVENTORY — filtra quantità 0 e disabilita cache
 app.get('/inventory', async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'unauthorized' });
   const userId = req.user.id;
@@ -361,10 +302,12 @@ app.get('/inventory', async (req, res) => {
          FROM inventory i
          JOIN shop_items s ON s.id = i.item_id
         WHERE i.user_id = $1
-          AND i.quantity > 0
+          AND i.quantity IS NOT NULL
+          AND i.quantity >= 1
         ORDER BY s.name ASC`,
       [userId]
     );
+    res.set('Cache-Control', 'no-store');
     res.json(rows);
   } catch (e) {
     console.error(e);
@@ -372,7 +315,7 @@ app.get('/inventory', async (req, res) => {
   }
 });
 
-// Usa 1 o più item; se la quantità scende a 0, elimina la riga
+// USE item — elimina la riga se arriva a 0
 app.post('/inventory/use', async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'unauthorized' });
   const userId = req.user.id;
@@ -383,31 +326,25 @@ app.post('/inventory/use', async (req, res) => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+
       const cur = await client.query(
         `SELECT id, quantity FROM inventory
          WHERE user_id = $1 AND item_id = $2
          FOR UPDATE`,
         [userId, item_id]
       );
-      if (cur.rowCount === 0) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'not_in_inventory' });
-      }
+      if (cur.rowCount === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'not_in_inventory' }); }
+
       const invId = cur.rows[0].id;
       const have = Number(cur.rows[0].quantity) || 0;
-      if (have < qty) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'not_enough_quantity' });
-      }
+      if (have < qty) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'not_enough_quantity' }); }
 
       const remaining = have - qty;
       if (remaining <= 0) {
-        // elimina riga
         await client.query(`DELETE FROM inventory WHERE id = $1`, [invId]);
         await client.query('COMMIT');
         return res.json({ ok: true, remaining: 0, deleted: true });
       } else {
-        // aggiorna quantità
         await client.query(
           `UPDATE inventory
              SET quantity = $2,
@@ -419,29 +356,23 @@ app.post('/inventory/use', async (req, res) => {
         return res.json({ ok: true, remaining });
       }
     } catch (e) {
-      await client.query('ROLLBACK');
-      console.error(e);
-      return res.status(500).json({ error: 'server_error' });
+      await client.query('ROLLBACK'); console.error(e); return res.status(500).json({ error: 'server_error' });
     } finally {
       client.release();
     }
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
+    console.error(e); return res.status(500).json({ error: 'server_error' });
   }
 });
 
-// ---------- EventSub (raw body + firma) ----------
+// EventSub
 const EVENTSUB_SECRET = process.env.TWITCH_EVENTSUB_SECRET || 'set-me';
-
 function timingSafeEqual(a, b) {
-  const ba = Buffer.from(a);
-  const bb = Buffer.from(b);
+  const ba = Buffer.from(a); const bb = Buffer.from(b);
   if (ba.length !== bb.length) return false;
   return crypto.timingSafeEqual(ba, bb);
 }
 
-// usa raw body SOLO per questa rotta
 app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     const messageId = req.get('Twitch-Eventsub-Message-Id') || '';
@@ -457,7 +388,6 @@ app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res
 
     const payload = rawBody ? JSON.parse(rawBody) : {};
     if (messageType === 'webhook_callback_verification') {
-      // handshake iniziale
       return res.status(200).type('text/plain').send(payload.challenge);
     }
 
@@ -466,15 +396,13 @@ app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res
       const ev = payload.event || {};
 
       if (subType === 'channel.subscribe') {
-        // +1 punto al subscriber
-        const twitchId = ev.user_id; // chi si è abbonato
+        const twitchId = ev.user_id;
         const username = ev.user_login || ev.user_name || ('user_'+twitchId);
         await grantPointsToTwitchUser(twitchId, username, 1);
       }
 
       if (subType === 'channel.subscription.gift') {
-        // +N punti al gifter (total può essere >1)
-        const twitchId = ev.user_id; // chi regala
+        const twitchId = ev.user_id;
         const username = ev.user_login || ev.user_name || ('user_'+twitchId);
         const n = Number(ev.total) || 1;
         await grantPointsToTwitchUser(twitchId, username, n);
@@ -483,7 +411,6 @@ app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res
       return res.status(200).json({ ok: true });
     }
 
-    // default
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error('eventsub error:', e);
@@ -491,13 +418,11 @@ app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res
   }
 });
 
-// assegna punti (total + unspent) e logga transazione
 async function grantPointsToTwitchUser(twitchId, username, delta) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // upsert utente
     const up = await client.query(`
       INSERT INTO users (twitch_id, username)
       VALUES ($1, $2)
@@ -534,7 +459,6 @@ async function grantPointsToTwitchUser(twitchId, username, delta) {
   }
 }
 
-// ---------- Utils ----------
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/_routes', (_req, res) => {
   const list = [];
@@ -555,22 +479,11 @@ app.get('/_routes', (_req, res) => {
   res.json(list);
 });
 
-// ---------- Static ----------
 app.use(express.static(path.join(__dirname, 'public'), { index: 'index.html', extensions: ['html'] }));
-
-// Alias comodi per leaderboard (se servono)
 app.get('/leaderboard/top', (_req, res) => res.redirect(301, '/api/leaderboard/top'));
 app.get('/leaderboard/unspent', (_req, res) => res.redirect(301, '/api/leaderboard/unspent'));
 app.get('/leaderboard', (_req, res) => res.redirect(301, '/leaderboard.html'));
 
-// ---------- Start ----------
-ensureTables()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Server avviato su http://localhost:${PORT}.`);
-    });
-  })
-  .catch((e) => {
-    console.error('DB init error:', e);
-    process.exit(1);
-  });
+ensureTables().then(() => {
+  app.listen(PORT, () => console.log(`Server avviato su http://localhost:${PORT}.`));
+}).catch(e => { console.error('DB init error:', e); process.exit(1); });
