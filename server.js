@@ -14,22 +14,19 @@ const {
   SESSION_SECRET = 'dev_secret_change_me',
   TWITCH_CLIENT_ID,
   TWITCH_CLIENT_SECRET,
-  TWITCH_CALLBACK_URL,
-  TWITCH_EVENTSUB_SECRET,
-  DATABASE_URL
+  TWITCH_CALLBACK_URL,       // es: https://api.malgax.com/auth/twitch/callback
+  TWITCH_EVENTSUB_SECRET,    // segreto per validare EventSub
+  DATABASE_URL               // stringa Neon
 } = process.env;
 
 const app = express();
 app.set('trust proxy', 1);
 
+// --- CORS & session ---
 app.use(cors({
   origin: ['https://www.malgax.com', 'https://malgax.com'],
   credentials: true
 }));
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
 app.use(session({
   secret: SESSION_SECRET,
   resave: false,
@@ -37,8 +34,10 @@ app.use(session({
   cookie: { httpOnly: true, sameSite: 'none', secure: true, maxAge: 1000*60*60*24*30 }
 }));
 
+// --- PG ---
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
+// --- Passport ---
 passport.serializeUser((user, done) => done(null, { id: user.id, twitch_id: user.twitch_id, username: user.username }));
 passport.deserializeUser((obj, done) => done(null, obj));
 
@@ -61,10 +60,10 @@ passport.use(new TwitchStrategy({
     done(null, upsert.rows[0]);
   } catch (e) { done(e); }
 }));
-
 app.use(passport.initialize());
 app.use(passport.session());
 
+// --- DB init ---
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -113,6 +112,7 @@ async function initDb() {
 }
 initDb().catch(err => { console.error('DB init error:', err); process.exit(1); });
 
+// --- Helpers ---
 function requireAuth(req, res, next) {
   if (req.isAuthenticated && req.isAuthenticated()) return next();
   return res.status(401).json({ error: 'unauthorized' });
@@ -134,7 +134,33 @@ async function grantPointsByTwitchId(client, twitch_id, username, delta) {
   await client.query(`INSERT INTO point_transactions (user_id, type, delta_points, points_before, points_after) VALUES ($1,'grant',$2,$3,$4)`, [u.id, delta, before, after]);
 }
 
-// OAuth
+function secureEqual(a, b) {
+  const ba = Buffer.from(a || '');
+  const bb = Buffer.from(b || '');
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+function computeSignature(secret, id, ts, raw) {
+  const hmac = crypto.createHmac('sha256', secret || '');
+  hmac.update(String(id || ''));
+  hmac.update(String(ts || ''));
+  hmac.update(String(raw || ''));
+  return 'sha256=' + hmac.digest('hex');
+}
+
+// --- Body parsers (con cattura RAW per /eventsub) ---
+// NB: mettiamo express.json DOPO aver definito la cattura del raw body
+app.use(express.json({
+  verify: (req, res, buf) => {
+    if (req.originalUrl === '/eventsub') {
+      // salviamo il raw body così come arrivato
+      req.twitchRawBody = buf.toString('utf8');
+    }
+  }
+}));
+app.use(express.urlencoded({ extended: true }));
+
+// --- OAuth ---
 app.get('/auth/twitch', (req, res, next) => {
   const isPopup = req.query.popup === '1';
   req.session.isPopup = isPopup;
@@ -166,9 +192,7 @@ app.get('/auth/twitch/callback',
             try{ if(window.parent && window.parent!==window) window.parent.postMessage({type:'login'}, '*'); }catch(e){}
           }
           window.tryClose = function(){
-            notify();
-            try{ window.open('','_self'); }catch(e){}
-            try{ window.close(); }catch(e){}
+            notify(); try{ window.open('','_self'); }catch(e){}; try{ window.close(); }catch(e){}
           }
           notify(); setTimeout(tryClose, 120); setTimeout(tryClose, 400); setTimeout(tryClose, 900);
         })();
@@ -213,7 +237,7 @@ app.get('/logout', (req, res, next) => {
   });
 });
 
-// API base
+// --- API base ---
 app.get('/me', async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'unauthorized' });
   try {
@@ -222,10 +246,9 @@ app.get('/me', async (req, res) => {
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: 'server_error' }); }
 });
-
 app.get('/health', (req, res) => res.type('text').send('ok'));
 
-// Leaderboard
+// --- Leaderboard ---
 app.get('/api/leaderboard', async (req, res) => {
   const by = (req.query.by === 'unspent') ? 'unspent_points' : 'total_points';
   try {
@@ -242,7 +265,7 @@ app.get('/api/leaderboard/unspent', (req, res) =>
     .then(r => res.json(r.rows)).catch(_ => res.status(500).json({ error: 'server_error' }))
 );
 
-// SHOP
+// --- SHOP ---
 app.get('/shop/items', async (req, res) => {
   try{
     const { rows } = await pool.query(
@@ -255,7 +278,6 @@ app.get('/shop/items', async (req, res) => {
     res.status(500).json({ error:'server_error' });
   }
 });
-
 app.post('/shop/purchase', requireAuth, async (req, res) => {
   const itemId = parseInt(req.body.item_id, 10);
   const qty    = Math.max(1, parseInt(req.body.quantity || '1', 10));
@@ -301,7 +323,7 @@ app.post('/shop/purchase', requireAuth, async (req, res) => {
   } finally { client.release(); }
 });
 
-// INVENTORY
+// --- INVENTORY ---
 app.get('/inventory', requireAuth, async (req, res) => {
   const { rows } = await pool.query(`
     SELECT i.id AS item_id, i.slug, i.name, i.kind, i.image_url, i.description, ui.quantity
@@ -312,7 +334,6 @@ app.get('/inventory', requireAuth, async (req, res) => {
   `, [req.user.id]);
   res.json(rows);
 });
-
 app.post('/inventory/use', requireAuth, async (req, res) => {
   const itemId = parseInt(req.body.item_id, 10);
   const qty = Math.max(1, parseInt(req.body.quantity || '1', 10));
@@ -343,30 +364,31 @@ app.post('/inventory/use', requireAuth, async (req, res) => {
   } finally { client.release(); }
 });
 
-// EventSub
-function verifyTwitchSignature(req, rawBody) {
-  const id = req.header('Twitch-Eventsub-Message-Id') || '';
-  const ts = req.header('Twitch-Eventsub-Message-Timestamp') || '';
-  const sig = req.header('Twitch-Eventsub-Message-Signature') || '';
-  const message = id + ts + rawBody;
-  const hmac = crypto.createHmac('sha256', TWITCH_EVENTSUB_SECRET || '');
-  const computed = 'sha256=' + hmac.update(message).digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(sig));
-}
-
-app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res) => {
-  const raw = req.body instanceof Buffer ? req.body.toString('utf8') : (typeof req.body === 'string' ? req.body : '');
+// --- EVENTSUB ---
+// Usiamo il RAW salvato da express.json({verify}) in req.twitchRawBody
+app.post('/eventsub', async (req, res) => {
+  const raw = (typeof req.twitchRawBody === 'string') ? req.twitchRawBody : '';
   const type = req.header('Twitch-Eventsub-Message-Type') || '';
+  const id   = req.header('Twitch-Eventsub-Message-Id') || '';
+  const ts   = req.header('Twitch-Eventsub-Message-Timestamp') || '';
+  const sigH = req.header('Twitch-Eventsub-Message-Signature') || '';
 
+  // handshake: rispondi col challenge (niente firma richiesta da Twitch in questa fase)
   if (type === 'webhook_callback_verification') {
-    try { const payload = JSON.parse(raw); return res.status(200).type('text/plain').send(payload.challenge); }
-    catch { return res.status(400).send('bad_request'); }
+    try {
+      const payload = JSON.parse(raw || '{}');
+      return res.status(200).type('text/plain').send(payload.challenge);
+    } catch { return res.status(400).send('bad_request'); }
   }
 
-  if (!verifyTwitchSignature(req, raw)) return res.status(403).type('text/plain').send('Invalid signature');
+  // verifica firma per notifiche
+  const computed = computeSignature(TWITCH_EVENTSUB_SECRET, id, ts, raw);
+  if (!secureEqual(computed, sigH)) {
+    return res.status(403).type('text/plain').send('Invalid signature');
+  }
 
   let payload = null;
-  try { payload = JSON.parse(raw); } catch { return res.status(400).send('bad_json'); }
+  try { payload = JSON.parse(raw || '{}'); } catch { return res.status(400).send('bad_json'); }
 
   if (type === 'notification') {
     const subType = payload.subscription?.type;
@@ -397,7 +419,7 @@ app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res
   res.status(200).type('text/plain').send('ok');
 });
 
-// Debug: elenco route
+// --- Debug routes ---
 app.get('/_routes', (req, res) => {
   const list = (app._router.stack || [])
     .filter(l => l.route && l.route.path)
@@ -409,10 +431,10 @@ app.get('/_routes', (req, res) => {
   res.json(list);
 });
 
-// Static
+// --- Static ---
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Start
+// --- Start ---
 app.listen(PORT, () => {
   console.log(`Server avviato su http://localhost:${PORT}`);
 });
