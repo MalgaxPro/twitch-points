@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Amministrazione — Eventi</title>
+  <style>
+    :root{
+      --bg:#0f1117; --panel:#151826; --muted:#9397a1; --text:#e7e9ee; --acc:#5b8cff; --grid:#1b2033;
+      --radius:14px;
+    }
+    html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,Roboto,Arial}
+    header{display:flex;align-items:center;gap:12px;padding:16px 18px;border-bottom:1px solid #22263a;background:linear-gradient(180deg,#12172a,transparent)}
+    header h1{font-size:18px;margin:0}
+    header .badge{font-size:12px;padding:2px 8px;border:1px solid #3a3f57;border-radius:999px;color:var(--muted)}
+    main{padding:18px;display:grid;gap:14px}
+    .panel{background:var(--panel);border:1px solid #20263e;border-radius:var(--radius);padding:14px}
+    .filters{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:10px}
+    .filters label{display:grid;gap:6px;font-size:12px;color:var(--muted)}
+    input,select,button{background:#0e1324;color:var(--text);border:1px solid #2a3150;border-radius:10px;padding:8px 10px}
+    button{cursor:pointer}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    .actions{display:flex;gap:10px}
+    .table{overflow:auto;border-radius:12px;border:1px solid #20263e}
+    table{width:100%;border-collapse:collapse;min-width:900px;background:#0e1324}
+    th,td{padding:10px 12px;border-bottom:1px solid #1a1f33;font-size:13px;vertical-align:top}
+    th{position:sticky;top:0;background:#111833;text-align:left}
+    tr:hover td{background:#0f1731}
+    .muted{color:var(--muted);font-size:12px}
+    .pill{display:inline-block;padding:2px 8px;border:1px solid #3a3f57;border-radius:999px;font-size:12px;color:#cfd5ff;background:#141b33}
+    .pagination{display:flex;gap:8px;align-items:center;justify-content:flex-end}
+    .pagination button[disabled]{opacity:.45;cursor:not-allowed}
+    .right{margin-left:auto}
+    .json{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;white-space:pre-wrap;word-break:break-word}
+    .status{font-size:12px;color:var(--muted)}
+    .ok{color:#9cffbd}
+    .warn{color:#ffd27a}
+    .err{color:#ff9b9b}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Amministrazione</h1>
+    <span class="badge">Eventi</span>
+    <div class="right status" id="status">Verifica accesso…</div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div class="filters">
+        <label>Tipo evento
+          <input id="f-type" placeholder="es. subscribe, purchase, redeem">
+        </label>
+        <label>Utente
+          <input id="f-user" placeholder="login o ID">
+        </label>
+        <label>Dal
+          <input id="f-from" type="datetime-local">
+        </label>
+        <label>Al
+          <input id="f-to" type="datetime-local">
+        </label>
+        <label>Limite
+          <input id="f-limit" type="number" min="1" max="500" value="50">
+        </label>
+        <label>Endpoint (facoltativo)
+          <input id="f-endpoint" placeholder="/events (default)">
+        </label>
+      </div>
+      <div class="row" style="margin-top:10px;align-items:center">
+        <div class="actions">
+          <button id="btn-load">Carica</button>
+          <button id="btn-auto">Auto refresh: OFF</button>
+          <button id="btn-export">Esporta CSV</button>
+          <button id="btn-clear">Pulisci filtri</button>
+        </div>
+        <div class="right pagination">
+          <button id="btn-prev" disabled>&larr; Prev</button>
+          <span id="page-indicator" class="muted">Pagina 1</span>
+          <button id="btn-next" disabled>Next &rarr;</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel table">
+      <table id="tbl">
+        <thead>
+          <tr>
+            <th style="width:120px">Quando</th>
+            <th style="width:140px">Tipo</th>
+            <th>Dettagli</th>
+            <th style="width:200px">Utente</th>
+            <th style="width:120px">Origine</th>
+            <th style="width:110px">ID</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="6" class="muted">Nessun dato. Premi “Carica”.</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+<script>
+(() => {
+  // ====== CONFIGURAZIONE ======
+  // 1) Endpoint eventi:
+  //    - per default usa percorsi relativi (funziona se hai rewrites su Vercel)
+  //    - altrimenti imposta qui l'URL assoluto del backend (es. 'https://api.malgax.com/events')
+  const DEFAULT_EVENTS_ENDPOINT = '/events';
+
+  // 2) Endpoint profilo per check login/permessi (deve rispondere con info utente)
+  const ME_ENDPOINT = '/me';
+
+  // 3) Politica: lato client mostro la pagina solo se l'utente è 'malgax'.
+  //    ATTENZIONE: è solo un check UX. L'autorizzazione vera va fatta sul server.
+  const ADMIN_LOGIN = 'malgax';
+
+  // 4) Funzione per derivare base API: se non usi rewrites, forziamo https://api.malgax.com
+  const API_BASE = (function(){
+    // Se la pagina è servita da malgax.com, ma NON hai rewrites, puoi forzare qui:
+    // return 'https://api.malgax.com';
+    return ''; // stringa vuota = usa relative path
+  })();
+
+  // ====== STATO ======
+  let page = 0;
+  let pageSize = 50;
+  let autoTimer = null;
+  let eventsCache = [];
+
+  // ====== ELEMENTI ======
+  const $ = sel => document.querySelector(sel);
+  const rows = $('#rows');
+  const status = $('#status');
+  const fType = $('#f-type');
+  const fUser = $('#f-user');
+  const fFrom = $('#f-from');
+  const fTo = $('#f-to');
+  const fLimit = $('#f-limit');
+  const fEndpoint = $('#f-endpoint');
+  const btnLoad = $('#btn-load');
+  const btnAuto = $('#btn-auto');
+  const btnExport = $('#btn-export');
+  const btnClear = $('#btn-clear');
+  const btnPrev = $('#btn-prev');
+  const btnNext = $('#btn-next');
+  const pageInd = $('#page-indicator');
+
+  // ====== UTIL ======
+  function fmtDate(iso){
+    if(!iso) return '';
+    const d = new Date(iso);
+    if(isNaN(d)) return String(iso);
+    return d.toLocaleString();
+  }
+  function esc(s){ return String(s ?? '').replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])) }
+  function qstr(params){
+    const sp = new URLSearchParams();
+    Object.entries(params).forEach(([k,v])=>{
+      if(v===undefined || v==='' || v===null) return;
+      sp.set(k, v);
+    });
+    const s = sp.toString();
+    return s ? ('?'+s) : '';
+  }
+  function toast(msg, cls=''){
+    status.innerHTML = `<span class="${cls}">${esc(msg)}</span>`;
+  }
+
+  function currentEndpoint(){
+    const custom = (fEndpoint.value || '').trim();
+    let base = API_BASE;
+    let path = custom || DEFAULT_EVENTS_ENDPOINT;
+    if(base && path.startsWith('/')) return base + path;
+    if(!base && path.startsWith('http')) return path;
+    return path; // relativo
+  }
+
+  function buildQuery(){
+    pageSize = Number(fLimit.value || 50) || 50;
+    const params = {
+      limit: pageSize,
+      offset: page * pageSize,
+      type: (fType.value || '').trim() || undefined,
+      user: (fUser.value || '').trim() || undefined,
+      from: fFrom.value ? new Date(fFrom.value).toISOString() : undefined,
+      to: fTo.value ? new Date(fTo.value).toISOString() : undefined,
+    };
+    return params;
+  }
+
+  async function checkMe(){
+    try{
+      const res = await fetch(API_BASE + ME_ENDPOINT, { credentials:'include' });
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const me = await res.json();
+      const login = me?.login || me?.name || me?.username || '';
+      if((login||'').toLowerCase() !== ADMIN_LOGIN){
+        toast('Accesso negato: utente non autorizzato', 'err');
+        document.querySelector('main').style.display='none';
+        return false;
+      }
+      toast(`Accesso: ${login}`, 'ok');
+      return true;
+    }catch(err){
+      toast('Impossibile verificare accesso. Effettua il login.', 'warn');
+      return false;
+    }
+  }
+
+  function renderTable(items){
+    rows.innerHTML = '';
+    if(!items?.length){
+      rows.innerHTML = `<tr><td colspan="6" class="muted">Nessun evento</td></tr>`;
+      return;
+    }
+    const fr = document.createDocumentFragment();
+    for(const ev of items){
+      const tr = document.createElement('tr');
+      const when = ev.created_at || ev.timestamp || ev.time || ev.at || null;
+      const type = ev.type || ev.event_type || ev.kind || '—';
+      const origin = ev.source || ev.origin || ev.provider || '—';
+      const uid = ev.id || ev.event_id || ev._id || '—';
+
+      // Dettagli leggibili + JSON min
+      const user = ev.user_login || ev.username || ev.user || ev.viewer || ev.twitch_login || '—';
+
+      const details = Object.assign({}, ev);
+      // Evita di stampare JSON enorme: taglia alcuni campi "heavy"
+      for(const k of ['raw','payload','body']) if(details[k] && typeof details[k]==='string' && details[k].length>400) details[k]=details[k].slice(0,400)+'…';
+
+      tr.innerHTML = `
+        <td>${esc(fmtDate(when))}</td>
+        <td><span class="pill">${esc(type)}</span></td>
+        <td class="json">${esc(JSON.stringify(details, null, 2))}</td>
+        <td>${esc(user)}</td>
+        <td class="muted">${esc(origin)}</td>
+        <td class="muted">${esc(uid)}</td>
+      `;
+      fr.appendChild(tr);
+    }
+    rows.appendChild(fr);
+  }
+
+  function updatePager(hasNext){
+    btnPrev.disabled = page<=0;
+    btnNext.disabled = !hasNext;
+    pageInd.textContent = `Pagina ${page+1}`;
+  }
+
+  async function load(){
+    const ok = await checkMe();
+    if(!ok) return;
+
+    const url = currentEndpoint();
+    const qs = qstr(buildQuery());
+    try{
+      toast('Caricamento…');
+      const res = await fetch(url + qs, { credentials:'include', cache:'no-store' });
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      // formato atteso: { items: [...], next?: boolean } — ma accetto anche array diretto
+      const data = await res.json();
+      const items = Array.isArray(data) ? data : (data.items || []);
+      const hasNext = Array.isArray(data) ? (items.length >= pageSize) : Boolean(data.next ?? (items.length >= pageSize));
+      eventsCache = items;
+      renderTable(items);
+      updatePager(hasNext);
+      toast(`Caricati ${items.length} evento/i`, 'ok');
+    }catch(err){
+      renderTable([]);
+      updatePager(false);
+      toast('Errore caricamento: '+err.message, 'err');
+    }
+  }
+
+  function clearFilters(){
+    fType.value = '';
+    fUser.value = '';
+    fFrom.value = '';
+    fTo.value = '';
+    // non tocco limit/endpoint
+  }
+
+  function toggleAuto(){
+    if(autoTimer){
+      clearInterval(autoTimer); autoTimer=null;
+      btnAuto.textContent = 'Auto refresh: OFF';
+      toast('Auto refresh disattivato');
+    }else{
+      autoTimer = setInterval(()=>{ load().catch(()=>{}) }, 15000);
+      btnAuto.textContent = 'Auto refresh: ON (15s)';
+      toast('Auto refresh attivato (15s)');
+    }
+  }
+
+  function exportCSV(){
+    if(!eventsCache?.length){
+      toast('Niente da esportare', 'warn');
+      return;
+    }
+    // CSV semplice con colonne principali + JSON intero
+    const cols = ['created_at','type','user','origin','id','json'];
+    const lines = [];
+    lines.push(cols.join(','));
+    for(const ev of eventsCache){
+      const when = ev.created_at || ev.timestamp || ev.time || ev.at || '';
+      const type = ev.type || ev.event_type || ev.kind || '';
+      const user = ev.user_login || ev.username || ev.user || ev.viewer || ev.twitch_login || '';
+      const origin = ev.source || ev.origin || ev.provider || '';
+      const id = ev.id || ev.event_id || ev._id || '';
+      const j = JSON.stringify(ev).replaceAll('"','""');
+      const row = [when,type,user,origin,id, j];
+      lines.push(row.map(v=> `"${String(v??'').replaceAll('"','""')}"`).join(','));
+    }
+    const blob = new Blob([lines.join('\n')], {type:'text/csv;charset=utf-8'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `events_${new Date().toISOString().replace(/[:.]/g,'-')}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  // ====== WIRE ======
+  btnLoad.addEventListener('click', ()=>{ page=0; load(); });
+  btnPrev.addEventListener('click', ()=>{ if(page>0){ page--; load(); }});
+  btnNext.addEventListener('click', ()=>{ page++; load(); });
+  btnAuto.addEventListener('click', toggleAuto);
+  btnExport.addEventListener('click', exportCSV);
+  btnClear.addEventListener('click', ()=>{ clearFilters(); page=0; load(); });
+
+  // Enter per lanciare la ricerca
+  [fType,fUser,fFrom,fTo,fLimit,fEndpoint].forEach(el=>{
+    el.addEventListener('keydown', e=>{ if(e.key==='Enter'){ page=0; load(); }});
+  });
+
+  // Primo caricamento "soft": non blocco se non loggato
+  // Premi "Carica" per forzare la richiesta.
+})();
+</script>
+</body>
+</html>
