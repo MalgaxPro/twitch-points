@@ -45,7 +45,7 @@ async function ensureView() {
     SELECT
       pt.id,                                   -- Event ID
       pt.created_at,                           -- Quando
-      COALESCE(pt.user_login, u.username) AS user_login,  -- Utente
+      u.username AS user_login,  -- Utente
       pt.item_id,
       COALESCE(pt.done, false) AS done,
       i.name AS item_name,                     -- Carta
