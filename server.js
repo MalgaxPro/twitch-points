@@ -21,9 +21,6 @@ function getUserLogin(req){
 require('./admin-routes')(app, pool, getUserLogin);
 
 // ...resto delle tue rotte...
-
-
-const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const cors = require('cors');
@@ -32,11 +29,9 @@ const session = require('express-session');
 const passport = require('passport');
 const TwitchStrategy = require('passport-twitch-new').Strategy;
 const { Pool } = require('pg');
-const express = require('express');
 const app = express();
 
 // in cima (se non l'hai già)
-const express = require('express');
 const app = express();
 app.use(express.json()); // <--- assicura il parser JSON
 
