@@ -1,4 +1,7 @@
-// server.js (API per Malgax Points) — v2.3 (fix ordine middleware di sessione)
+// server.js — v2.4
+// - Fix crash on fast login/logout: use persistent session store (connect-pg-simple)
+// - Move Pool before session
+// - Use keepSessionInfo to avoid session.regenerate race
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
@@ -8,6 +11,7 @@ const cors = require('cors');
 const passport = require('passport');
 const TwitchStrategy = require('passport-twitch-new').Strategy;
 const { Pool } = require('pg');
+const pgSessionFactory = require('connect-pg-simple');
 
 const {
   PORT = 3000,
@@ -28,8 +32,17 @@ app.use(cors({
   credentials: true
 }));
 
-// *** IMPORTANTE ***: montiamo la sessione PRIMA dei body parser e di passport
+// DB Pool prima della sessione (serve al session store)
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+// Sessione persistente su Postgres (niente più MemoryStore)
+const PgSession = pgSessionFactory(session);
 app.use(session({
+  store: new PgSession({
+    pool,
+    tableName: 'user_sessions',
+    createTableIfMissing: true
+  }),
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
@@ -41,15 +54,12 @@ const rawBodySaver = (req, res, buf) => { if (buf && buf.length) req.rawBody = b
 app.use(express.json({ limit: '1mb', verify: rawBodySaver }));
 app.use(express.urlencoded({ extended: true }));
 
-// Piccolo guard per capire se la sessione manca (debug)
 app.use((req,res,next)=>{
   if(!req.session){
     console.error('[WARN] req.session mancante su', req.method, req.originalUrl);
   }
   next();
 });
-
-const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 passport.serializeUser((user, done) => done(null, { id: user.id, twitch_id: user.twitch_id, username: user.username }));
 passport.deserializeUser((obj, done) => done(null, obj));
@@ -218,8 +228,6 @@ async function grantPointsByTwitchId(client, twitch_id, username, delta) {
 }
 
 app.get('/auth/twitch', (req, res, next) => {
-  // assicurati che la sessione esista
-  if(!req.session){ console.error('[AUTH] Sessione assente prima di authenticate'); }
   const isPopup = req.query.popup === '1';
   req.session.isPopup = isPopup;
   const state = isPopup ? 'popup' : 'redir';
@@ -227,9 +235,8 @@ app.get('/auth/twitch', (req, res, next) => {
 });
 
 app.get('/auth/twitch/callback',
-  passport.authenticate('twitch', { failureRedirect: '/auth-failed.html' }),
+  passport.authenticate('twitch', { failureRedirect: '/auth-failed.html', keepSessionInfo: true }),
   async (req, res) => {
-    if(!req.session){ console.error('[AUTH] Sessione assente dopo authenticate'); }
     try{
       const name = req.user?.username || '';
       res.cookie('user_login', name, { sameSite:'none', secure:true });
