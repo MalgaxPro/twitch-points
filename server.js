@@ -38,11 +38,11 @@ function getUserLogin(req) {
   return String(h || '').toLowerCase();
 }
 function ensureIsAdmin(req, res, next) {
-  const who = getUserLogin(req);
+  const who = (req.cookies?.user_login_lc || req.cookies?.user_login || '').toLowerCase();
   if (who === 'malgax') return next();
-  // lascio aperti i GET per leggere; togli questa riga se vuoi chiuderli
   if (req.method === 'GET') return next();
   return res.status(403).json({ error: 'forbidden' });
+});
 }
 
 // ---------- Init: VIEW per admin ----------
@@ -73,8 +73,11 @@ app.get('/healthz', (req, res) => res.status(200).send('ok'));
 
 // Piccolo /me basato sul cookie
 app.get('/me', (req, res) => {
-  const login = getUserLogin(req);
-  if (!login) return res.status(401).json({ error: 'unauthorized' });
+  const loginShown = req.cookies?.user_login;
+  const loginLc    = (req.cookies?.user_login_lc || req.cookies?.user_login || '').toLowerCase();
+  if (!loginLc) return res.status(401).json({ error: 'unauthorized' });
+  res.json({ login: loginShown || loginLc, login_lc: loginLc });
+});
   res.json({ login });
 });
 
@@ -220,6 +223,19 @@ app.get('/auth/twitch', async (req, res) => {
 
 // GET /auth/twitch/callback
 app.get('/auth/twitch/callback', async (req, res) => {
+  // --- Added: store both display name and lowercase login in cookies ---
+  const twitchUser = user?.data?.[0] || {};
+  const login_lc = (twitchUser.login || '').toLowerCase();
+  const display   = twitchUser.display_name || twitchUser.login;
+  // cookie to show proper case on the site
+  res.cookie('user_login', display, {
+    httpOnly: false, sameSite: 'none', secure: true, path: '/', maxAge: 7*24*60*60*1000
+  });
+  // cookie for comparisons (always lowercase)
+  res.cookie('user_login_lc', login_lc, {
+    httpOnly: false, sameSite: 'none', secure: true, path: '/', maxAge: 7*24*60*60*1000
+  });
+
   try{
     const { code, state } = req.query;
     if(!code || !state) return res.status(400).send('Missing code/state');
