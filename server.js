@@ -10,7 +10,41 @@ const session = require('express-session');
 const passport = require('passport');
 const TwitchStrategy = require('passport-twitch-new').Strategy;
 const { Pool } = require('pg');
+const express = require('express');
+const app = express();
 
+// in cima (se non l'hai già)
+const express = require('express');
+const app = express();
+app.use(express.json()); // <--- assicura il parser JSON
+
+// Pool Postgres (se non esiste già)
+const { Pool } = require('pg');
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Funzione per ricavare il login dell'utente loggato (adatta al tuo auth)
+function getUserLogin(req){
+  // se usi req.user.login:
+  return (req.user?.login || req.user?.username || '').toLowerCase();
+}
+
+// IMPORTA LE ROTTE ADMIN (metti il file admin-routes.js nella stessa cartella)
+require('./admin-routes')(app, pool, getUserLogin);
+
+// ...il resto delle tue route esistenti...
+// app.get('/me', ...)
+// app.post('/shop/purchase', ...)
+// ecc.
+
+
+const { Pool } = require('pg');
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,   // su Render deve essere impostata
+  ssl: { rejectUnauthorized: false }
+});
 const app = express();
 
 const PORT = process.env.PORT || 3000;
