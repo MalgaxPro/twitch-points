@@ -53,7 +53,7 @@ async function ensureView() {
     FROM point_transactions pt
     LEFT JOIN users u ON u.id = pt.user_id
     JOIN items i ON i.id = pt.item_id
-    WHERE pt.event_type = 'use';
+    WHERE pt.type = 'use';
   `;
   await pool.query(createView);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_pt_created_at ON point_transactions (created_at DESC);`);
