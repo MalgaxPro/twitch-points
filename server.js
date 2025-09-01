@@ -1,7 +1,8 @@
-// server.js — API minimale per "carte usate"
+// server.js — backend minimo per malgax: login dev + carte + classifiche + admin
 
 const express = require('express');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
 const { Pool } = require('pg');
 
 const APP_ORIGIN = process.env.APP_ORIGIN || 'https://www.malgax.com';
@@ -9,10 +10,15 @@ const PORT = process.env.PORT || 3000;
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(cors({ origin: [APP_ORIGIN], credentials: true }));
-app.use(express.json());
 
-// ---- Postgres (Neon) ----
+app.use(cors({
+  origin: [APP_ORIGIN],
+  credentials: true
+}));
+app.use(express.json());
+app.use(cookieParser());
+
+// ---------- Postgres ----------
 if (!process.env.DATABASE_URL) {
   console.error('❌ Missing env DATABASE_URL');
   process.exit(1);
@@ -22,57 +28,130 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ---- Util ----
+// ---------- Utils ----------
 function getUserLogin(req) {
-  // Per ora leggiamo da header (utile per test con curl/Postman)
-  // Esempio:  -H "X-User-Login: malgax"
-  const u = req.get('x-user-login') || '';
-  return String(u || '').toLowerCase();
+  // 1) cookie da /auth/dev-login
+  const c = req.cookies?.user_login;
+  if (c) return String(c).toLowerCase();
+  // 2) header manuale per test
+  const h = req.get('x-user-login');
+  return String(h || '').toLowerCase();
 }
-
 function ensureIsAdmin(req, res, next) {
   const who = getUserLogin(req);
   if (who === 'malgax') return next();
-  // Per comodità lasciamo i GET aperti; togli questa riga se vuoi chiuderli
+  // lascio aperti i GET per leggere; togli questa riga se vuoi chiuderli
   if (req.method === 'GET') return next();
   return res.status(403).json({ error: 'forbidden' });
 }
 
-// ---- Init: crea/aggiorna VIEW standardizzata ----
+// ---------- Init: VIEW per admin ----------
 async function ensureView() {
   const createView = `
     CREATE OR REPLACE VIEW admin_used_cards AS
     SELECT
-      pt.id,                                   -- Event ID
-      pt.created_at,                           -- Quando
-      u.username AS user_login,  -- Utente
+      pt.id,                          -- Event ID
+      pt.created_at,                  -- Quando
+      u.username AS user_login,       -- Utente (da users)
       pt.item_id,
       COALESCE(pt.done, false) AS done,
-      i.name AS item_name,                     -- Carta
-      i.kind AS kind                           -- Tipo (creature/incantesimo/istantanea)
+      i.name AS item_name,            -- Carta
+      i.kind AS kind                  -- Tipo
     FROM point_transactions pt
     LEFT JOIN users u ON u.id = pt.user_id
     JOIN items i ON i.id = pt.item_id
     WHERE pt.type = 'use';
   `;
-  await pool.query(createView);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_pt_created_at ON point_transactions (created_at DESC);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_pt_done ON point_transactions (done);`);
+  await pool.query(createView).catch(()=>{});
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_pt_created_at ON point_transactions (created_at DESC);`).catch(()=>{});
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_pt_done ON point_transactions (done);`).catch(()=>{});
 }
 
-// ---- Rotte base ----
+// ---------- Rotte base ----------
 app.get('/', (req, res) => res.json({ ok: true, service: 'malgax-api', ts: new Date().toISOString() }));
 app.get('/healthz', (req, res) => res.status(200).send('ok'));
 
-// Piccolo /me che usa solo l’header per il test
+// Piccolo /me basato sul cookie
 app.get('/me', (req, res) => {
   const login = getUserLogin(req);
   if (!login) return res.status(401).json({ error: 'unauthorized' });
   res.json({ login });
 });
 
-// ---- Rotte ADMIN ----
-// GET /admin/used-cards?kind=&status=&user=&item=&from=&to=&limit=
+// ---------- DEV LOGIN (sostituisce momentaneamente /auth/twitch) ----------
+app.post('/auth/dev-login', (req, res) => {
+  const login = String(req.body?.login || '').toLowerCase().trim();
+  if (!login) return res.status(400).json({ error: 'missing_login' });
+  res.cookie('user_login', login, {
+    httpOnly: false,
+    sameSite: 'none',
+    secure: true,
+    path: '/',
+    maxAge: 7 * 24 * 60 * 60 * 1000
+  });
+  res.json({ ok: true, login });
+});
+
+app.post('/auth/dev-logout', (req, res) => {
+  res.clearCookie('user_login', { path: '/', sameSite: 'none', secure: true });
+  res.json({ ok: true });
+});
+
+// ---------- INVENTORY (carte) ----------
+app.get('/inventory', async (req, res) => {
+  try {
+    const q = `
+      SELECT id, slug, name, kind, cost_points, image_url, description
+      FROM items
+      ORDER BY name ASC;
+    `;
+    const { rows } = await pool.query(q);
+    res.json({ items: rows });
+  } catch (e) {
+    console.error('ERR /inventory', e);
+    // non mando 500: restituisco array vuoto così il frontend non esplode
+    res.json({ items: [] });
+  }
+});
+
+// ---------- LEADERBOARD ----------
+app.get('/api/leaderboard/top', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || '50', 10), 200);
+    const q = `
+      SELECT id, username, total_points
+      FROM users
+      WHERE total_points IS NOT NULL
+      ORDER BY total_points DESC, username ASC
+      LIMIT $1;
+    `;
+    const { rows } = await pool.query(q, [limit]);
+    res.json({ items: rows });
+  } catch (e) {
+    console.error('ERR /api/leaderboard/top', e);
+    res.json({ items: [] });
+  }
+});
+
+app.get('/api/leaderboard/unspent', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || '50', 10), 200);
+    const q = `
+      SELECT id, username, unspent_points
+      FROM users
+      WHERE unspent_points IS NOT NULL
+      ORDER BY unspent_points DESC, username ASC
+      LIMIT $1;
+    `;
+    const { rows } = await pool.query(q, [limit]);
+    res.json({ items: rows });
+  } catch (e) {
+    console.error('ERR /api/leaderboard/unspent', e);
+    res.json({ items: [] });
+  }
+});
+
+// ---------- ADMIN: lista usi carte ----------
 app.get('/admin/used-cards', ensureIsAdmin, async (req, res) => {
   try {
     const { kind, status = 'all', user, item, from, to, limit = 100 } = req.query;
@@ -104,7 +183,7 @@ app.get('/admin/used-cards', ensureIsAdmin, async (req, res) => {
   }
 });
 
-// POST /admin/used-cards/complete  body: { id, done:true|false }
+// ---------- ADMIN: segna fatto ----------
 app.post('/admin/used-cards/complete', ensureIsAdmin, async (req, res) => {
   try {
     const { id, done = true } = req.body || {};
@@ -117,11 +196,11 @@ app.post('/admin/used-cards/complete', ensureIsAdmin, async (req, res) => {
   }
 });
 
-// ---- Avvio ----
+// ---------- Avvio ----------
 (async () => {
   try {
     await pool.connect();
-    await ensureView();
+    await ensureView(); // non fallire il deploy se la view non si crea
     app.listen(PORT, () => console.log(`✅ API up on :${PORT} (origin ${APP_ORIGIN})`));
   } catch (e) {
     console.error('❌ Startup error:', e);
