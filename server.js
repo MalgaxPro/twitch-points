@@ -1,7 +1,5 @@
-// server.js — v2.4
-// - Fix crash on fast login/logout: use persistent session store (connect-pg-simple)
-// - Move Pool before session
-// - Use keepSessionInfo to avoid session.regenerate race
+// server.js — v2.5
+// Fix: crash on fast logout (req.session undefined) using keepSessionInfo:true and safe destroy
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
@@ -32,10 +30,8 @@ app.use(cors({
   credentials: true
 }));
 
-// DB Pool prima della sessione (serve al session store)
+// DB Pool and persistent session store (Postgres)
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
-
-// Sessione persistente su Postgres (niente più MemoryStore)
 const PgSession = pgSessionFactory(session);
 app.use(session({
   store: new PgSession({
@@ -49,17 +45,13 @@ app.use(session({
   cookie: { httpOnly: true, sameSite: 'none', secure: true, maxAge: 1000*60*60*24*30 }
 }));
 
-// Raw body per EventSub
+// Raw body for EventSub signature
 const rawBodySaver = (req, res, buf) => { if (buf && buf.length) req.rawBody = buf.toString('utf8'); };
 app.use(express.json({ limit: '1mb', verify: rawBodySaver }));
 app.use(express.urlencoded({ extended: true }));
 
-app.use((req,res,next)=>{
-  if(!req.session){
-    console.error('[WARN] req.session mancante su', req.method, req.originalUrl);
-  }
-  next();
-});
+const warnNoSession = (req,res,next)=>{ if(!req.session){ console.error('[WARN] req.session missing on', req.method, req.originalUrl); } next(); };
+app.use(warnNoSession);
 
 passport.serializeUser((user, done) => done(null, { id: user.id, twitch_id: user.twitch_id, username: user.username }));
 passport.deserializeUser((obj, done) => done(null, obj));
@@ -227,13 +219,15 @@ async function grantPointsByTwitchId(client, twitch_id, username, delta) {
   `, [id, delta, before, after]);
 }
 
+// OAuth start
 app.get('/auth/twitch', (req, res, next) => {
   const isPopup = req.query.popup === '1';
-  req.session.isPopup = isPopup;
+  if (req.session) req.session.isPopup = isPopup;
   const state = isPopup ? 'popup' : 'redir';
   passport.authenticate('twitch', { state })(req, res, next);
 });
 
+// OAuth callback
 app.get('/auth/twitch/callback',
   passport.authenticate('twitch', { failureRedirect: '/auth-failed.html', keepSessionInfo: true }),
   async (req, res) => {
@@ -270,15 +264,22 @@ app.get('/auth/twitch/callback',
   }
 );
 
-app.get('/logout', (req, res) => {
-  try{
-    res.clearCookie('user_login');
-    res.clearCookie('user_login_lc');
-    req.logout?.(()=>{});
-    req.session?.destroy(()=>{});
-  }catch(_){}
+// Logout safe (no regenerate; keepSessionInfo: true)
+app.get('/logout', async (req, res) => {
   const isPopup = req.query.popup === '1';
-  res.type('html').send(`
+
+  try { res.clearCookie('user_login'); res.clearCookie('user_login_lc'); } catch{}
+
+  // Tell passport to NOT regenerate the session
+  if (typeof req.logout === 'function') {
+    try {
+      await new Promise((resolve, reject) =>
+        req.logout({ keepSessionInfo: true }, err => err ? reject(err) : resolve())
+      );
+    } catch (e) { console.error('logout error:', e); }
+  }
+
+  const sendHtml = () => res.type('html').send(`
     <!doctype html><meta charset="utf-8"><title>Logout</title>
     <style>body{margin:0;display:grid;place-items:center;height:100vh;background:#0f0f14;color:#e9e9f4;
     font:16px system-ui,Segoe UI,Roboto,Arial}.box{background:#14141c;border:1px solid rgba(255,255,255,.15);
@@ -295,8 +296,19 @@ app.get('/logout', (req, res) => {
       })();
     </script>
   `);
+
+  // Safely destroy session if present
+  try {
+    if (req.session && typeof req.session.destroy === 'function') {
+      return req.session.destroy(() => sendHtml());
+    }
+  } catch (e) { console.error('session destroy error:', e); }
+
+  // No session present — just respond
+  sendHtml();
 });
 
+// Authenticated whoami
 app.get('/me', async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'unauthorized' });
   try {
