@@ -1,11 +1,10 @@
 // admin-routes.js
 module.exports = function setupAdminRoutes(app, pool, getUserLogin) {
-  // getUserLogin(req) deve restituire il login in minuscolo (es. 'malgax')
   function ensureIsAdmin(req, res, next) {
     const who = (getUserLogin && getUserLogin(req)) || '';
     if (who === 'malgax') return next();
-    // CONSENTI lettura anche se non admin? metti return next() qui sopra.
-    if (req.method === 'GET') return next(); // <-- lettura pubblica (se vuoi, tieni così)
+    // Consenti GET a tutti per leggere (se vuoi chiudere, rimuovi la riga sotto)
+    if (req.method === 'GET') return next();
     return res.status(403).json({ error: 'forbidden' });
   }
 
@@ -18,7 +17,7 @@ module.exports = function setupAdminRoutes(app, pool, getUserLogin) {
       const params = [];
 
       if (kind) { params.push(kind); where.push(`i.kind = $${params.length}`); }
-      if (user) { params.push(user); where.push(`LOWER(pt.user_login) = LOWER($${params.length})`); }
+      if (user) { params.push(user); where.push(`LOWER(COALESCE(pt.user_login, u.username)) = LOWER($${params.length})`); }
       if (item) { params.push(`%${item}%`); where.push(`LOWER(i.name) LIKE LOWER($${params.length})`); }
       if (from) { params.push(new Date(from)); where.push(`pt.created_at >= $${params.length}`); }
       if (to)   { params.push(new Date(to));   where.push(`pt.created_at <= $${params.length}`); }
@@ -28,10 +27,16 @@ module.exports = function setupAdminRoutes(app, pool, getUserLogin) {
       params.push(Number(limit)); const limIdx = params.length;
 
       const sql = `
-        SELECT pt.id, pt.created_at, pt.user_login, pt.item_id,
-               COALESCE(pt.done,false) AS done,
-               i.name AS item_name, i.kind AS kind
+        SELECT
+          pt.id,                                 -- Event ID
+          pt.created_at,                         -- Quando
+          COALESCE(pt.user_login, u.username) AS user_login, -- Utente
+          pt.item_id,
+          COALESCE(pt.done,false) AS done,
+          i.name AS item_name,                   -- Carta
+          i.kind AS kind                         -- Tipo (creature/incantesimo/istantanea)
         FROM point_transactions pt
+        LEFT JOIN users u ON u.id = pt.user_id
         JOIN items i ON i.id = pt.item_id
         WHERE ${where.join(' AND ')}
         ORDER BY pt.created_at DESC
