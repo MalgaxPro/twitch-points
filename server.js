@@ -1,540 +1,166 @@
-// server.js
-require('dotenv').config();
+// server.js — API minimale per carte usate (Render + Neon)
 
-// Se non già presenti:
 const express = require('express');
-const app = express();
-app.use(express.json());
-
-const { Pool } = require('pg');
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-
-// Ricava il login dell'utente loggato dal tuo auth (adatta se diverso)
-function getUserLogin(req){
-  return (req.user?.login || req.user?.username || '').toLowerCase();
-}
-
-// IMPORTA le nuove rotte admin
-require('./admin-routes')(app, pool, getUserLogin);
-
-// ...resto delle tue rotte...
-const path = require('path');
-const crypto = require('crypto');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
-const session = require('express-session');
-const passport = require('passport');
-const TwitchStrategy = require('passport-twitch-new').Strategy;
 const { Pool } = require('pg');
-const app = express();
 
-// in cima (se non l'hai già)
-const app = express();
-app.use(express.json()); // <--- assicura il parser JSON
-
-// Pool Postgres (se non esiste già)
-const { Pool } = require('pg');
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-
-// Funzione per ricavare il login dell'utente loggato (adatta al tuo auth)
-function getUserLogin(req){
-  // se usi req.user.login:
-  return (req.user?.login || req.user?.username || '').toLowerCase();
-}
-
-// IMPORTA LE ROTTE ADMIN (metti il file admin-routes.js nella stessa cartella)
-require('./admin-routes')(app, pool, getUserLogin);
-
-// ...il resto delle tue route esistenti...
-// app.get('/me', ...)
-// app.post('/shop/purchase', ...)
-// ecc.
-
-
-const { Pool } = require('pg');
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,   // su Render deve essere impostata
-  ssl: { rejectUnauthorized: false }
-});
-const app = express();
-
+const APP_ORIGIN = process.env.APP_ORIGIN || 'https://www.malgax.com';
 const PORT = process.env.PORT || 3000;
-const NODE_ENV = process.env.NODE_ENV || 'development';
 
-const ORIGINS = [
-  'http://localhost:3000',
-  'http://127.0.0.1:3000',
-  'https://malgax.com',
-  'https://www.malgax.com',
-  'https://api.malgax.com',
-];
-
+const app = express();
 app.set('trust proxy', 1);
-app.use(cors({ origin: ORIGINS, credentials: true }));
+app.use(cors({ origin: [APP_ORIGIN], credentials: true }));
+app.use(express.json());
 app.use(cookieParser());
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
+// ------------ Postgres (Neon) ------------
+if (!process.env.DATABASE_URL) {
+  console.error('❌ Missing env DATABASE_URL');
+  process.exit(1);
+}
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-async function ensureTables() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      twitch_id TEXT UNIQUE NOT NULL,
-      username TEXT NOT NULL,
-      total_points INTEGER NOT NULL DEFAULT 0,
-      unspent_points INTEGER NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS point_transactions (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      type TEXT NOT NULL,
-      delta_points INTEGER NOT NULL,
-      points_before INTEGER NOT NULL,
-      points_after INTEGER NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS shop_items (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      kind TEXT NOT NULL,
-      cost_points INTEGER NOT NULL,
-      image_url TEXT NOT NULL,
-      active BOOLEAN NOT NULL DEFAULT TRUE
-    );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS inventory (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      item_id INTEGER NOT NULL REFERENCES shop_items(id) ON DELETE CASCADE,
-      quantity INTEGER NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE(user_id, item_id)
-    );
-  `);
+// ------------ Util ------------
+function getUserLogin(req) {
+  // 1) se hai un middleware auth che mette req.user:
+  const u =
+    (req.user && (req.user.login || req.user.username)) ||
+    // 2) header manuale per test (es. con Postman):  X-User-Login: malgax
+    req.get('x-user-login') ||
+    // 3) cookie per test (vedi /auth/dev-login): user_login=malgax
+    req.cookies.user_login ||
+    '';
+  return String(u || '').toLowerCase();
 }
 
-const sessionOpts = {
-  secret: process.env.SESSION_SECRET || 'change-me',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    sameSite: NODE_ENV === 'production' ? 'none' : 'lax',
-    secure: NODE_ENV === 'production',
-    maxAge: 1000 * 60 * 60 * 24 * 30,
-  },
-};
-app.use(session(sessionOpts));
-app.use(passport.initialize());
-app.use(passport.session());
+function ensureIsAdmin(req, res, next) {
+  const who = getUserLogin(req);
+  if (who === 'malgax') return next();
+  // Consenti lettura a tutti per comodità (toglimi se vuoi chiudere):
+  if (req.method === 'GET') return next();
+  return res.status(403).json({ error: 'forbidden' });
+}
 
-passport.serializeUser((user, done) => done(null, user.id));
-passport.deserializeUser(async (id, done) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, twitch_id, username, total_points, unspent_points FROM users WHERE id = $1`,
-      [id]
-    );
-    if (rows.length) return done(null, rows[0]);
-    return done(null, false);
-  } catch (e) {
-    return done(e);
-  }
-});
+// ------------ Init: crea/aggiorna VIEW standard ------------
+async function ensureView() {
+  const sql = `
+    CREATE OR REPLACE VIEW admin_used_cards AS
+    SELECT
+      pt.id,                                   -- Event ID
+      pt.created_at,                           -- Quando
+      COALESCE(pt.user_login, u.username) AS user_login,  -- Utente
+      pt.item_id,
+      COALESCE(pt.done, false) AS done,
+      i.name AS item_name,                     -- Carta
+      i.kind AS kind                           -- Tipo (creature/incantesimo/istantanea)
+    FROM point_transactions pt
+    LEFT JOIN users u ON u.id = pt.user_id
+    JOIN items i ON i.id = pt.item_id
+    WHERE pt.event_type = 'use';
+  `;
+  await pool.query(sql);
+  // indici consigliati (idempotenti)
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_pt_created_at ON point_transactions (created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_pt_done ON point_transactions (done);`);
+}
 
-const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
-const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
-const TWITCH_CALLBACK_URL =
-  process.env.TWITCH_CALLBACK_URL ||
-  process.env.CALLBACK_URL ||
-  'http://localhost:3000/auth/twitch/callback';
-
-passport.use(new TwitchStrategy({
-  clientID: TWITCH_CLIENT_ID,
-  clientSecret: TWITCH_CLIENT_SECRET,
-  callbackURL: TWITCH_CALLBACK_URL,
-  scope: ['user:read:email', 'channel:read:subscriptions'],
-  passReqToCallback: true,
-}, async (req, accessToken, refreshToken, profile, done) => {
-  try {
-    const twitchId = profile.id;
-    const username = profile.display_name || profile.username || `user_${twitchId}`;
-    const up = await pool.query(`
-      INSERT INTO users (twitch_id, username)
-      VALUES ($1, $2)
-      ON CONFLICT (twitch_id)
-      DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
-      RETURNING id, twitch_id, username, total_points, unspent_points
-    `, [twitchId, username]);
-    return done(null, up.rows[0]);
-  } catch (e) {
-    return done(e);
-  }
-}));
-
-app.get('/auth/twitch', (req, res, next) => {
-  passport.authenticate('twitch', { state: 'login' })(req, res, next);
-});
-
-app.get('/auth/twitch/callback',
-  passport.authenticate('twitch', { failureRedirect: '/auth-failed.html' }),
-  (req, res) => {
-    const origin = (req.headers.referer && new URL(req.headers.referer).origin) || '*';
-    res.status(200).type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Login OK</title></head>
-<body style="background:#0f0f14;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh">
-<div>✅ Login effettuato. Puoi chiudere questa finestra.</div>
-<script>
-  try { if (window.opener) { window.opener.postMessage({ type: 'login' }, '${origin}'); window.close(); } } catch(_) {}
-</script>
-</body></html>`);
-  }
-);
-
-app.get('/logout', (req, res) => {
-  const origin = (req.headers.referer && new URL(req.headers.referer).origin) || '*';
-  const send = () => {
-    res.status(200).type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Logout</title></head>
-<body style="background:#0f0f14;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh">
-<div>👋 Logout eseguito. Puoi chiudere questa finestra.</div>
-<script>
-  try { if (window.opener) { window.opener.postMessage({ type: 'logout' }, '${origin}'); window.close(); } } catch(_) {}
-</script>
-</body></html>`);
-  };
-  if (req.logout) { req.logout(() => req.session?.destroy(()=> send())); }
-  else { req.session?.destroy(()=> send()); }
-});
+// ------------ Rotte base ------------
+app.get('/', (req, res) => res.json({ ok: true, service: 'malgax-api', ts: new Date().toISOString() }));
+app.get('/healthz', (req, res) => res.status(200).send('ok'));
 
 app.get('/me', (req, res) => {
-  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
-  res.json(req.user);
+  const login = getUserLogin(req);
+  if (!login) return res.status(401).json({ error: 'unauthorized' });
+  res.json({ login }); // forma minima usata dal frontend
 });
 
-app.get('/api/leaderboard/top', async (_req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT username, total_points AS points
-      FROM users
-      WHERE total_points > 0
-      ORDER BY total_points DESC, username ASC
-      LIMIT 100
-    `);
-    res.json(rows);
-  } catch (e) {
-    console.error(e); res.status(500).json({ error: 'server_error' });
-  }
-});
-
-app.get('/api/leaderboard/unspent', async (_req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT username, unspent_points AS points
-      FROM users
-      WHERE unspent_points > 0
-      ORDER BY unspent_points DESC, username ASC
-      LIMIT 100
-    `);
-    res.json(rows);
-  } catch (e) {
-    console.error(e); res.status(500).json({ error: 'server_error' });
-  }
-});
-
-app.get('/shop/items', async (_req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT id, name, kind, cost_points, image_url
-      FROM shop_items
-      WHERE active = TRUE
-      ORDER BY id ASC
-    `);
-    res.json(rows);
-  } catch (e) {
-    console.error(e); res.status(500).json({ error: 'server_error' });
-  }
-});
-
-app.post('/shop/purchase', async (req, res) => {
-  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
-  const userId = req.user.id;
-  const { item_id, quantity } = req.body;
-  const qty = Math.max(1, Number(quantity || 1));
-
-  try {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      const it = await client.query(
-        `SELECT id, name, cost_points FROM shop_items WHERE id = $1 AND active = TRUE`,
-        [item_id]
-      );
-      if (it.rowCount === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'item_not_found' }); }
-      const item = it.rows[0];
-      const totalCost = item.cost_points * qty;
-
-      const u = await client.query(
-        `SELECT id, unspent_points FROM users WHERE id = $1 FOR UPDATE`,
-        [userId]
-      );
-      if (u.rowCount === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'user_not_found' }); }
-      const beforePts = Number(u.rows[0].unspent_points) || 0;
-      if (beforePts < totalCost) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'insufficient_points' }); }
-
-      const u2 = await client.query(
-        `UPDATE users
-           SET unspent_points = unspent_points - $2,
-               updated_at = NOW()
-         WHERE id = $1
-         RETURNING unspent_points`,
-        [userId, totalCost]
-      );
-      const afterPts = Number(u2.rows[0].unspent_points) || 0;
-
-      await client.query(
-        `INSERT INTO inventory (user_id, item_id, quantity)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (user_id, item_id)
-         DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity,
-                       updated_at = NOW()`,
-        [userId, item_id, qty]
-      );
-
-      await client.query(
-        `INSERT INTO point_transactions (user_id, type, delta_points, points_before, points_after)
-         VALUES ($1, 'spend', $2, $3, $4)`,
-        [userId, -totalCost, beforePts, afterPts]
-      );
-
-      await client.query('COMMIT');
-      res.json({ ok: true, unspent_after: afterPts });
-    } catch (e) {
-      await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'server_error' });
-    } finally {
-      client.release();
-    }
-  } catch (e) {
-    console.error(e); res.status(500).json({ error: 'server_error' });
-  }
-});
-
-// INVENTORY — filtra quantità 0 e disabilita cache
-app.get('/inventory', async (req, res) => {
-  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
-  const userId = req.user.id;
-  try {
-    const { rows } = await pool.query(
-      `SELECT i.item_id, i.quantity, s.name, s.image_url
-         FROM inventory i
-         JOIN shop_items s ON s.id = i.item_id
-        WHERE i.user_id = $1
-          AND i.quantity IS NOT NULL
-          AND i.quantity >= 1
-        ORDER BY s.name ASC`,
-      [userId]
-    );
-    res.set('Cache-Control', 'no-store');
-    res.json(rows);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-
-// USE item — elimina la riga se arriva a 0
-app.post('/inventory/use', async (req, res) => {
-  if (!req.user) return res.status(401).json({ error: 'unauthorized' });
-  const userId = req.user.id;
-  const { item_id, quantity } = req.body;
-  const qty = Math.max(1, Number(quantity || 1));
-
-  try {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      const cur = await client.query(
-        `SELECT id, quantity FROM inventory
-         WHERE user_id = $1 AND item_id = $2
-         FOR UPDATE`,
-        [userId, item_id]
-      );
-      if (cur.rowCount === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'not_in_inventory' }); }
-
-      const invId = cur.rows[0].id;
-      const have = Number(cur.rows[0].quantity) || 0;
-      if (have < qty) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'not_enough_quantity' }); }
-
-      const remaining = have - qty;
-      if (remaining <= 0) {
-        await client.query(`DELETE FROM inventory WHERE id = $1`, [invId]);
-        await client.query('COMMIT');
-        return res.json({ ok: true, remaining: 0, deleted: true });
-      } else {
-        await client.query(
-          `UPDATE inventory
-             SET quantity = $2,
-                 updated_at = NOW()
-           WHERE id = $1`,
-          [invId, remaining]
-        );
-        await client.query('COMMIT');
-        return res.json({ ok: true, remaining });
-      }
-    } catch (e) {
-      await client.query('ROLLBACK'); console.error(e); return res.status(500).json({ error: 'server_error' });
-    } finally {
-      client.release();
-    }
-  } catch (e) {
-    console.error(e); return res.status(500).json({ error: 'server_error' });
-  }
-});
-
-// EventSub
-const EVENTSUB_SECRET = process.env.TWITCH_EVENTSUB_SECRET || 'set-me';
-function timingSafeEqual(a, b) {
-  const ba = Buffer.from(a); const bb = Buffer.from(b);
-  if (ba.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ba, bb);
-}
-
-app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res) => {
-  try {
-    const messageId = req.get('Twitch-Eventsub-Message-Id') || '';
-    const timestamp = req.get('Twitch-Eventsub-Message-Timestamp') || '';
-    const signature = req.get('Twitch-Eventsub-Message-Signature') || '';
-    const messageType = req.get('Twitch-Eventsub-Message-Type') || '';
-    const rawBody = req.body instanceof Buffer ? req.body.toString('utf8') : String(req.body || '');
-    const expected = 'sha256=' + crypto.createHmac('sha256', EVENTSUB_SECRET).update(messageId + timestamp + rawBody).digest('hex');
-
-    if (!timingSafeEqual(signature, expected)) {
-      return res.status(403).type('text/plain').send('Invalid signature');
-    }
-
-    const payload = rawBody ? JSON.parse(rawBody) : {};
-    if (messageType === 'webhook_callback_verification') {
-      return res.status(200).type('text/plain').send(payload.challenge);
-    }
-
-    if (messageType === 'notification') {
-      const subType = payload.subscription?.type;
-      const ev = payload.event || {};
-
-      if (subType === 'channel.subscribe') {
-        const twitchId = ev.user_id;
-        const username = ev.user_login || ev.user_name || ('user_'+twitchId);
-        await grantPointsToTwitchUser(twitchId, username, 1);
-      }
-
-      if (subType === 'channel.subscription.gift') {
-        const twitchId = ev.user_id;
-        const username = ev.user_login || ev.user_name || ('user_'+twitchId);
-        const n = Number(ev.total) || 1;
-        await grantPointsToTwitchUser(twitchId, username, n);
-      }
-
-      return res.status(200).json({ ok: true });
-    }
-
-    return res.status(200).json({ ok: true });
-  } catch (e) {
-    console.error('eventsub error:', e);
-    return res.status(500).type('text/plain').send('server_error');
-  }
-});
-
-async function grantPointsToTwitchUser(twitchId, username, delta) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const up = await client.query(`
-      INSERT INTO users (twitch_id, username)
-      VALUES ($1, $2)
-      ON CONFLICT (twitch_id)
-      DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()
-      RETURNING id, total_points, unspent_points
-    `, [twitchId, username]);
-
-    const userId = up.rows[0].id;
-    const before = Number(up.rows[0].unspent_points) || 0;
-
-    const upd = await client.query(`
-      UPDATE users
-         SET total_points   = total_points + $2,
-             unspent_points = unspent_points + $2,
-             updated_at     = NOW()
-       WHERE id = $1
-       RETURNING unspent_points
-    `, [userId, delta]);
-
-    const after = Number(upd.rows[0].unspent_points) || (before + delta);
-
-    await client.query(`
-      INSERT INTO point_transactions (user_id, type, delta_points, points_before, points_after)
-      VALUES ($1, 'grant', $2, $3, $4)
-    `, [userId, delta, before, after]);
-
-    await client.query('COMMIT');
-  } catch (e) {
-    await client.query('ROLLBACK');
-    console.error('grantPoints error:', e);
-  } finally {
-    client.release();
-  }
-}
-
-app.get('/health', (_req, res) => res.json({ ok: true }));
-app.get('/_routes', (_req, res) => {
-  const list = [];
-  const stack = app._router && app._router.stack || [];
-  stack.forEach((m) => {
-    if (m.route && m.route.path) {
-      const methods = Object.keys(m.route.methods).filter(k => m.route.methods[k]).map(k => k.toUpperCase());
-      list.push({ path: m.route.path, methods });
-    } else if (m.name === 'router' && m.handle && m.handle.stack) {
-      m.handle.stack.forEach((h) => {
-        if (h.route && h.route.path) {
-          const methods = Object.keys(h.route.methods).filter(k => h.route.methods[k]).map(k => k.toUpperCase());
-          list.push({ path: h.route.path, methods });
-        }
-      });
-    }
+// (Facoltativo) dev login via cookie per test su Render senza SSO.
+// Abilitalo aggiungendo DEV_AUTH=true nelle env se vuoi usarlo.
+if (process.env.DEV_AUTH === 'true') {
+  app.post('/auth/dev-login', (req, res) => {
+    const login = String(req.body?.login || '').toLowerCase();
+    if (!login) return res.status(400).json({ error: 'missing login' });
+    res.cookie('user_login', login, {
+      httpOnly: false,
+      sameSite: 'lax',
+      secure: true,
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+      domain: undefined, // lasciare undefined su Render
+      path: '/',
+    });
+    res.json({ ok: true, login });
   });
-  res.json(list);
+  app.post('/auth/dev-logout', (_, res) => {
+    res.clearCookie('user_login', { path: '/' });
+    res.json({ ok: true });
+  });
+}
+
+// ------------ Rotte ADMIN --------------
+
+// GET /admin/used-cards
+// Filtri: kind=creature|incantesimo|istantanea, status=all|pending|done,
+//         user, item, from, to, limit
+app.get('/admin/used-cards', ensureIsAdmin, async (req, res) => {
+  try {
+    const { kind, status = 'all', user, item, from, to, limit = 100 } = req.query;
+
+    const where = ['1=1'];
+    const params = [];
+
+    if (kind) { params.push(kind); where.push(`kind = $${params.length}`); }
+    if (user) { params.push(user); where.push(`LOWER(user_login) = LOWER($${params.length})`); }
+    if (item) { params.push(`%${item}%`); where.push(`LOWER(item_name) LIKE LOWER($${params.length})`); }
+    if (from) { params.push(new Date(from)); where.push(`created_at >= $${params.length}`); }
+    if (to)   { params.push(new Date(to));   where.push(`created_at <= $${params.length}`); }
+    if (status === 'pending') where.push(`done = false`);
+    if (status === 'done')    where.push(`done = true`);
+
+    params.push(Number(limit)); const limIdx = params.length;
+
+    const sql = `
+      SELECT id, created_at, user_login, item_id, done, item_name, kind
+      FROM admin_used_cards
+      WHERE ${where.join(' AND ')}
+      ORDER BY created_at DESC
+      LIMIT $${limIdx};
+    `;
+
+    const { rows } = await pool.query(sql, params);
+    res.json({ items: rows });
+  } catch (err) {
+    console.error('ERR /admin/used-cards', err);
+    res.status(500).json({ error: 'db_error' });
+  }
 });
 
-app.use(express.static(path.join(__dirname, 'public'), { index: 'index.html', extensions: ['html'] }));
-app.get('/leaderboard/top', (_req, res) => res.redirect(301, '/api/leaderboard/top'));
-app.get('/leaderboard/unspent', (_req, res) => res.redirect(301, '/api/leaderboard/unspent'));
-app.get('/leaderboard', (_req, res) => res.redirect(301, '/leaderboard.html'));
+// POST /admin/used-cards/complete  body: { id, done:true|false }
+app.post('/admin/used-cards/complete', ensureIsAdmin, async (req, res) => {
+  try {
+    const { id, done = true } = req.body || {};
+    if (!id) return res.status(400).json({ error: 'missing_id' });
+    await pool.query(`UPDATE point_transactions SET done = $1 WHERE id = $2`, [!!done, id]);
+    res.json({ ok: true, id, done: !!done });
+  } catch (err) {
+    console.error('ERR /admin/used-cards/complete', err);
+    res.status(500).json({ error: 'db_error' });
+  }
+});
 
-ensureTables().then(() => {
-  app.listen(PORT, () => console.log(`Server avviato su http://localhost:${PORT}.`));
-}).catch(e => { console.error('DB init error:', e); process.exit(1); });
+// ------------ Avvio ------------
+(async () => {
+  try {
+    await pool.connect(); // apre una connessione per validare l'URL
+    await ensureView();
+    app.listen(PORT, () => {
+      console.log(`✅ API up on :${PORT} (origin ${APP_ORIGIN})`);
+    });
+  } catch (e) {
+    console.error('❌ Startup error:', e);
+    process.exit(1);
+  }
+})();
