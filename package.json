@@ -1,18 +1,17 @@
 {
-  "name": "malgax-api",
-  "version": "1.0.0",
-  "main": "server.js",
-  "type": "commonjs",
+  "engines": { "node": ">=18 <25" },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "render-build": "echo 'build step not required'",
+    "render-start": "node server.js"
   },
   "dependencies": {
-    "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "pg": "^8.11.3"
-  },
-  "engines": {
-    "node": ">=18"
+    "express-session": "^1.18.0",
+    "passport": "^0.7.0",
+    "passport-twitch-new": "^0.1.1",
+    "pg": "^8.12.0"
   }
 }
