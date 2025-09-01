@@ -3,12 +3,12 @@ module.exports = function setupAdminRoutes(app, pool, getUserLogin) {
   function ensureIsAdmin(req, res, next) {
     const who = (getUserLogin && getUserLogin(req)) || '';
     if (who === 'malgax') return next();
-    // Consenti GET a tutti per leggere (se vuoi chiudere, rimuovi la riga sotto)
+    // Se vuoi chiudere anche i GET, elimina la riga sotto:
     if (req.method === 'GET') return next();
     return res.status(403).json({ error: 'forbidden' });
   }
 
-  // GET /admin/used-cards
+  // GET /admin/used-cards  (lista usi carte con filtri)
   app.get('/admin/used-cards', ensureIsAdmin, async (req, res) => {
     try {
       const { kind, status = 'all', user, item, from, to, limit = 100 } = req.query;
@@ -51,7 +51,7 @@ module.exports = function setupAdminRoutes(app, pool, getUserLogin) {
     }
   });
 
-  // POST /admin/used-cards/complete  body: { id, done:true|false }
+  // POST /admin/used-cards/complete  { id, done:true|false }
   app.post('/admin/used-cards/complete', ensureIsAdmin, async (req, res) => {
     try {
       const { id, done = true } = req.body || {};
