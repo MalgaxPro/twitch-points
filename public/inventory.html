@@ -34,7 +34,6 @@
   <div id="toast" class="toast"></div>
 
   <script>
-    const API = 'https://api.malgax.com';
     async function showToast(msg, ms=2000){ const t=document.getElementById('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none', ms); }
 
     async function loadInventory(){
@@ -43,7 +42,7 @@
       grid.innerHTML = '<div class="muted">Caricamento…</div>';
       empty.style.display='none';
       try{
-        const r=await fetch(API+'/inventory', {credentials:'include', cache:'no-store'});
+        const r=await fetch('/inventory', {credentials:'include', cache:'no-store'});
         if(r.status===401){ grid.innerHTML='<div class="muted">Devi accedere con Twitch.</div>'; return; }
         const items=await r.json();
         if(!Array.isArray(items) || !items.length){ grid.innerHTML=''; empty.style.display='block'; return; }
@@ -67,7 +66,7 @@
           const id = Number(b.dataset.id);
           b.disabled = true;
           try{
-            const r = await fetch(API+'/inventory/use', {
+            const r = await fetch('/inventory/use', {
               method:'POST', credentials:'include',
               headers:{ 'Content-Type':'application/json' },
               body: JSON.stringify({ item_id:id, quantity:1 })
