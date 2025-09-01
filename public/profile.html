@@ -34,7 +34,7 @@
       const q = new URLSearchParams(location.search);
       const silent = q.get('silent') === '1';
       try{
-        const res = await fetch('/me', { credentials: 'include', cache: 'no-store' });
+        const res = await fetch('https://api.malgax.com/me', { credentials: 'include', cache: 'no-store' });
         let me = null;
         if(res.ok){ me = await res.json(); }
 
@@ -59,7 +59,7 @@
               <p><strong>Utente:</strong> ${payload.me.username}</p>
               <p><strong>Punti disponibili:</strong> <span class="coin"></span> ${payload.me.unspent_points}</p>
               <div class="actions">
-                <a class="btn" href="/logout">Logout</a>
+                <a class="btn" href="https://api.malgax.com/logout">Logout</a>
               </div>
               <p class="muted" style="margin-top:10px">Questa pagina comunica il tuo stato di login al sito principale.</p>
             `;
@@ -68,7 +68,7 @@
               <h2>Non autenticato</h2>
               <p class="muted">Effettua l'accesso con Twitch per vedere il profilo.</p>
               <div class="actions">
-                <a class="btn" href="/auth/twitch">Accedi con Twitch</a>
+                <a class="btn" href="https://api.malgax.com/auth/twitch">Accedi con Twitch</a>
               </div>
             `;
           }

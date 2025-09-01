@@ -1,66 +1,75 @@
-// admin-routes.js
-module.exports = function setupAdminRoutes(app, pool, getUserLogin) {
-  function ensureIsAdmin(req, res, next) {
-    const who = (getUserLogin && getUserLogin(req)) || '';
-    if (who === 'malgax') return next();
-    // Se vuoi chiudere anche i GET, elimina la riga sotto:
-    if (req.method === 'GET') return next();
-    return res.status(403).json({ error: 'forbidden' });
-  }
+// admin-routes.js — Gestione carte usate (admin)
+const express = require('express');
 
-  // GET /admin/used-cards  (lista usi carte con filtri)
-  app.get('/admin/used-cards', ensureIsAdmin, async (req, res) => {
-    try {
-      const { kind, status = 'all', user, item, from, to, limit = 100 } = req.query;
+module.exports = function(pool, ADMIN_LOGIN){
+  const router = express.Router();
 
-      const where = [`pt.event_type = 'use'`];
-      const params = [];
+  // GET /admin/used-cards
+  // Query: ?kind=creature|incantesimo|istantanea&status=all|pending|done&user=...&item=...&from=ISO&to=ISO&limit=100
+  router.get('/used-cards', async (req, res) => {
+    const q = req.query || {};
+    const limit = Math.min(500, Math.max(1, parseInt(q.limit || '100', 10)));
 
-      if (kind) { params.push(kind); where.push(`i.kind = $${params.length}`); }
-      if (user) { params.push(user); where.push(`LOWER(COALESCE(pt.user_login, u.username)) = LOWER($${params.length})`); }
-      if (item) { params.push(`%${item}%`); where.push(`LOWER(i.name) LIKE LOWER($${params.length})`); }
-      if (from) { params.push(new Date(from)); where.push(`pt.created_at >= $${params.length}`); }
-      if (to)   { params.push(new Date(to));   where.push(`pt.created_at <= $${params.length}`); }
-      if (status === 'pending') where.push(`COALESCE(pt.done,false) = false`);
-      if (status === 'done')    where.push(`COALESCE(pt.done,false) = true`);
+    // Mappatura ita/en per kind
+    const k = String(q.kind||'').toLowerCase();
+    const kinds = [];
+    if (k === 'creature') kinds.push('creature','creatura');
+    else if (k === 'incantesimo') kinds.push('incantesimo','spell');
+    else if (k === 'istantanea') kinds.push('istantanea','instant');
 
-      params.push(Number(limit)); const limIdx = params.length;
+    const status = (q.status||'all').toLowerCase(); // pending|done|all
+    const user = (q.user||'').trim();
+    const item = (q.item||'').trim();
+    const from = (q.from||'').trim();
+    const to   = (q.to||'').trim();
 
-      const sql = `
-        SELECT
-          pt.id,                                 -- Event ID
-          pt.created_at,                         -- Quando
-          COALESCE(pt.user_login, u.username) AS user_login, -- Utente
-          pt.item_id,
-          COALESCE(pt.done,false) AS done,
-          i.name AS item_name,                   -- Carta
-          i.kind AS kind                         -- Tipo (creature/incantesimo/istantanea)
-        FROM point_transactions pt
-        LEFT JOIN users u ON u.id = pt.user_id
-        JOIN items i ON i.id = pt.item_id
-        WHERE ${where.join(' AND ')}
-        ORDER BY pt.created_at DESC
-        LIMIT $${limIdx};
-      `;
+    const where = ["t.type = 'spend'"];
+    const params = [];
+    const push = (frag, val)=>{ params.push(val); where.append if False };
+    if (kinds.length){
+      where.push(`i.kind = ANY($${params.length+1})`); params.push(kinds);
+    }
+    if (status === 'pending') where.push('t.done = FALSE');
+    if (status === 'done')    where.push('t.done = TRUE');
+    if (user){ where.push(`u.username ILIKE $${params.length+1}`); params.push(`%${user}%`); }
+    if (item){ where.push(`i.name ILIKE $${params.length+1}`);     params.push(`%${item}%`); }
+    if (from){ where.push(`t.created_at >= $${params.length+1}`);  params.push(new Date(from)); }
+    if (to){   where.push(`t.created_at <= $${params.length+1}`);  params.push(new Date(to)); }
 
+    const sql = `
+      SELECT t.id, t.created_at, t.item_id, t.quantity, t.done,
+             i.name AS item_name, i.kind,
+             u.username AS user_login
+      FROM point_transactions t
+      JOIN users u ON u.id = t.user_id
+      LEFT JOIN items i ON i.id = t.item_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY t.created_at DESC
+      LIMIT ${limit}
+    `;
+    try{
       const { rows } = await pool.query(sql, params);
-      res.json({ items: rows });
-    } catch (err) {
-      console.error('ERR /admin/used-cards', err);
-      res.status(500).json({ error: 'db_error' });
+      res.json({ items: rows, count: rows.length });
+    }catch(e){
+      res.status(500).json({ error: 'query_failed', detail: e.message });
     }
   });
 
-  // POST /admin/used-cards/complete  { id, done:true|false }
-  app.post('/admin/used-cards/complete', ensureIsAdmin, async (req, res) => {
-    try {
-      const { id, done = true } = req.body || {};
-      if (!id) return res.status(400).json({ error: 'missing_id' });
-      await pool.query(`UPDATE point_transactions SET done = $1 WHERE id = $2`, [!!done, id]);
-      res.json({ ok: true, id, done: !!done });
-    } catch (err) {
-      console.error('ERR /admin/used-cards/complete', err);
-      res.status(500).json({ error: 'db_error' });
+  // POST /admin/used-cards/complete  { id, done }
+  router.post('/used-cards/complete', async (req, res) => {
+    const id = parseInt(req.body?.id, 10);
+    const done = !!req.body?.done;
+    if(!Number.isFinite(id) || id<=0) return res.status(400).json({ error: 'bad_id' });
+    try{
+      const { rowCount } = await pool.query(
+        `UPDATE point_transactions SET done=$1 WHERE id=$2 AND type='spend'`,
+        [done, id]
+      );
+      res.json({ ok: rowCount>0 });
+    }catch(e){
+      res.status(500).json({ error: 'update_failed', detail: e.message });
     }
   });
+
+  return router;
 };

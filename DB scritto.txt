@@ -1,0 +1,121 @@
+# Schema `public`
+
+## `admin_used_cards`
+| colonna     | tipo                         | null | default |
+|-------------|------------------------------|:----:|---------|
+| id          | bigint                       |  sì  |         |
+| created_at  | timestamp with time zone     |  sì  |         |
+| user_login  | text                         |  sì  |         |
+| item_id     | integer                      |  sì  |         |
+| done        | boolean                      |  sì  |         |
+| item_name   | text                         |  sì  |         |
+| kind        | text                         |  sì  |         |
+
+**PK:** *(nessuna esplicita)*  
+**FK:** *(nessuna)*  
+**Indici/Univocità:** *(nessuno indicato)*  
+**Note:** mantiene traccia di carte/usate a scopo admin; `item_id` non è vincolato a `items`.
+
+---
+
+## `eventsub_seen`
+| colonna     | tipo                         | null | default |
+|-------------|------------------------------|:----:|---------|
+| msg_id      | text                         |  no  |         |
+| received_at | timestamp with time zone     |  no  | `now()` |
+
+**PK:** `eventsub_seen_pkey (msg_id)`  
+**FK:** *(nessuna)*  
+**Indici/Univocità:** *(solo PK)*
+
+---
+
+## `items`
+| colonna       | tipo                     | null | default                                   |
+|---------------|--------------------------|:----:|-------------------------------------------|
+| id            | integer                  |  no  | `nextval('items_id_seq'::regclass)`       |
+| slug          | text                     |  no  |                                           |
+| name          | text                     |  no  |                                           |
+| kind          | text                     |  no  |                                           |
+| cost_points   | integer                  |  no  |                                           |
+| image_url     | text                     |  no  |                                           |
+| description   | text                     | sì   | `''::text`                                |
+| created_at    | timestamp with time zone |  no  | `now()`                                    |
+
+**PK:** `items_pkey (id)`  
+**FK:** *(nessuna)*  
+**Indici/Univocità:** `items_slug_key (UNIQUE slug)`  
+**Usata da:** `point_transactions.item_id`, `user_items.item_id`
+
+---
+
+## `playing_with_neon`
+| colonna | tipo     | null | default                                          |
+|---------|----------|:----:|--------------------------------------------------|
+| id      | integer  |  no  | `nextval('playing_with_neon_id_seq'::regclass)` |
+| name    | text     |  no  |                                                  |
+| value   | real     | sì   |                                                  |
+
+**PK:** `playing_with_neon_pkey (id)`  
+**FK:** *(nessuna)*
+
+---
+
+## `point_transactions`
+| colonna        | tipo                     | null | default                                      |
+|----------------|--------------------------|:----:|----------------------------------------------|
+| id             | bigint                   |  no  | `nextval('point_transactions_id_seq'::regclass)` |
+| user_id        | integer                  |  no  |                                              |
+| type           | text                     |  no  |                                              |
+| delta_points   | integer                  |  no  |                                              |
+| item_id        | integer                  | sì   |                                              |
+| quantity       | integer                  | sì   |                                              |
+| client_token   | text                     | sì   |                                              |
+| points_before  | integer                  |  no  |                                              |
+| points_after   | integer                  |  no  |                                              |
+| created_at     | timestamp with time zone |  no  | `now()`                                       |
+| done           | boolean                  |  no  | `false`                                       |
+
+**PK:** `point_transactions_pkey (id)`  
+**FK:** 
+- `point_transactions_user_id_fkey`: `user_id → users(id)`
+- `point_transactions_item_id_fkey`: `item_id → items(id)`  
+**Indici/Univocità:** *(solo quelli impliciti da PK/FK)*
+
+---
+
+## `user_items`
+| colonna  | tipo     | null | default                               |
+|----------|----------|:----:|---------------------------------------|
+| id       | integer  |  no  | `nextval('user_items_id_seq'::regclass)` |
+| user_id  | integer  |  no  |                                       |
+| item_id  | integer  |  no  |                                       |
+| quantity | integer  |  no  |                                       |
+
+**PK:** `user_items_pkey (id)`  
+**FK:** 
+- `user_items_user_id_fkey`: `user_id → users(id)`
+- `user_items_item_id_fkey`: `item_id → items(id)`  
+**Indici/Univocità:** `user_items_user_id_item_id_key (UNIQUE user_id, item_id)`  
+**Note:** coppia `(user_id, item_id)` unica → un record per item per utente.
+
+---
+
+## `users`
+| colonna        | tipo                     | null | default                         |
+|----------------|--------------------------|:----:|---------------------------------|
+| id             | integer                  |  no  | `nextval('users_id_seq'::regclass)` |
+| twitch_id      | text                     |  no  |                                 |
+| username       | text                     | sì   |                                 |
+| total_points   | integer                  |  no  | `0`                             |
+| unspent_points | integer                  |  no  | `0`                             |
+| created_at     | timestamp with time zone |  no  | `now()`                         |
+| updated_at     | timestamp with time zone |  no  | `now()`                         |
+| username_lc    | text                     | sì   |                                 |
+
+**PK:** `users_pkey (id)`  
+**FK:** *(nessuna)*  
+**Indici/Univocità:** `users_twitch_id_key (UNIQUE twitch_id)`  
+**Usata da:** `point_transactions.user_id`, `user_items.user_id`
+
+---
