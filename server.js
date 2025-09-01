@@ -1,4 +1,4 @@
-// server.js (API per Malgax Points) — v2
+// server.js (API per Malgax Points) — v2.1
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
@@ -28,7 +28,9 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json({ limit: '1mb' }));
+// Per EventSub raw
+const rawBodySaver = (req, res, buf) => { if (buf && buf.length) req.rawBody = buf.toString('utf8'); };
+app.use(express.json({ limit: '1mb', verify: rawBodySaver }));
 app.use(express.urlencoded({ extended: true }));
 
 app.use(session({
@@ -43,24 +45,77 @@ const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorize
 passport.serializeUser((user, done) => done(null, { id: user.id, twitch_id: user.twitch_id, username: user.username }));
 passport.deserializeUser((obj, done) => done(null, obj));
 
+async function mergeUsersOnLogin(client, twitch_id, username, username_lc){
+  // 1) esiste per twitch_id?
+  const byTid = await client.query(`SELECT * FROM users WHERE twitch_id=$1`, [twitch_id]);
+  if (byTid.rows[0]) {
+    // aggiorna username se cambiato
+    await client.query(`UPDATE users SET username=$1, username_lc=LOWER($1), updated_at=NOW() WHERE id=$2`, [username, byTid.rows[0].id]);
+    return byTid.rows[0].id;
+  }
+  // 2) cerca duplicati per username_lc
+  const dup = await client.query(`SELECT * FROM users WHERE username_lc=$1 ORDER BY (total_points + unspent_points) DESC NULLS LAST`, [username_lc]);
+  if (dup.rows[0]) {
+    const primary = dup.rows[0];
+    // collega twitch_id al primary
+    await client.query(`UPDATE users SET twitch_id=$1, username=$2, username_lc=LOWER($2), updated_at=NOW() WHERE id=$3`, [twitch_id, username, primary.id]);
+    // unisci eventuali altri duplicati
+    for (let i=1;i<dup.rows.length;i++){
+      const other = dup.rows[i];
+      if (other.id === primary.id) continue;
+      // porta transazioni
+      await client.query(`UPDATE point_transactions SET user_id=$1 WHERE user_id=$2`, [primary.id, other.id]);
+      // unisci inventario
+      const inv = await client.query(`SELECT item_id, quantity FROM user_items WHERE user_id=$1`, [other.id]);
+      for (const r of inv.rows){
+        await client.query(`
+          INSERT INTO user_items (user_id, item_id, quantity)
+          VALUES ($1,$2,$3)
+          ON CONFLICT (user_id, item_id) DO UPDATE SET quantity = user_items.quantity + EXCLUDED.quantity
+        `, [primary.id, r.item_id, r.quantity]);
+      }
+      await client.query(`DELETE FROM user_items WHERE user_id=$1`, [other.id]);
+      // somma counters
+      await client.query(`
+        UPDATE users
+        SET total_points = COALESCE(total_points,0) + COALESCE($1,0),
+            unspent_points = COALESCE(unspent_points,0) + COALESCE($2,0)
+        WHERE id=$3
+      `, [other.total_points||0, other.unspent_points||0, primary.id]);
+      // elimina duplicato
+      await client.query(`DELETE FROM users WHERE id=$1`, [other.id]);
+    }
+    return primary.id;
+  }
+  // 3) nessuno: crea nuovo
+  const ins = await client.query(`
+    INSERT INTO users (twitch_id, username, username_lc)
+    VALUES ($1,$2,LOWER($2))
+    RETURNING id
+  `, [twitch_id, username]);
+  return ins.rows[0].id;
+}
+
 passport.use(new TwitchStrategy({
   clientID: TWITCH_CLIENT_ID,
   clientSecret: TWITCH_CLIENT_SECRET,
   callbackURL: TWITCH_CALLBACK_URL,
   scope: ['user:read:email']
 }, async (accessToken, refreshToken, profile, done) => {
+  const tid = String(profile.id);
+  const uname = profile.display_name || profile.username || profile.login || 'Utente';
+  const uname_lc = String(uname).toLowerCase();
+  const client = await pool.connect();
   try {
-    const tid = String(profile.id);
-    const uname = profile.display_name || profile.username || profile.login || 'Utente';
-    const upsert = await pool.query(`
-      INSERT INTO users (twitch_id, username, username_lc)
-      VALUES ($1, $2, LOWER($2))
-      ON CONFLICT (twitch_id)
-      DO UPDATE SET username = EXCLUDED.username, username_lc = LOWER(EXCLUDED.username), updated_at = NOW()
-      RETURNING id, twitch_id, username, total_points, unspent_points
-    `, [tid, uname]);
-    done(null, upsert.rows[0]);
-  } catch (e) { done(e); }
+    await client.query('BEGIN');
+    const userId = await mergeUsersOnLogin(client, tid, uname, uname_lc);
+    const { rows } = await client.query(`SELECT id, twitch_id, username, total_points, unspent_points FROM users WHERE id=$1`, [userId]);
+    await client.query('COMMIT');
+    done(null, rows[0]);
+  } catch(e) {
+    await client.query('ROLLBACK');
+    done(e);
+  } finally { client.release(); }
 }));
 
 app.use(passport.initialize());
@@ -71,7 +126,7 @@ async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
-      twitch_id TEXT UNIQUE NOT NULL,
+      twitch_id TEXT UNIQUE,
       username TEXT,
       username_lc TEXT,
       total_points INTEGER NOT NULL DEFAULT 0,
@@ -80,6 +135,7 @@ async function initDb() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tid ON users(twitch_id);
+    CREATE INDEX IF NOT EXISTS idx_users_uname_lc ON users(LOWER(username_lc));
 
     CREATE TABLE IF NOT EXISTS items (
       id SERIAL PRIMARY KEY,
@@ -138,29 +194,29 @@ function requireAdmin(req, res, next) {
 }
 
 async function grantPointsByTwitchId(client, twitch_id, username, delta) {
-  const uRes = await client.query(`
-    INSERT INTO users (twitch_id, username, username_lc)
-    VALUES ($1, $2, LOWER($2))
-    ON CONFLICT (twitch_id)
-    DO UPDATE SET username = COALESCE(EXCLUDED.username, users.username),
-                  username_lc = LOWER(COALESCE(EXCLUDED.username, users.username)),
-                  updated_at=NOW()
-    RETURNING id, total_points, unspent_points
-  `, [twitch_id, username || null]);
-  const u = uRes.rows[0];
+  const uname = username || null;
+  // collega/crea utente per twitch_id preservando username esistente
+  const id = await (async ()=>{
+    const row = await client.query(`SELECT id FROM users WHERE twitch_id=$1`, [twitch_id]);
+    if (row.rows[0]) return row.rows[0].id;
+    // se non esiste, prova merge su username_lc
+    return await mergeUsersOnLogin(client, twitch_id, uname, String(uname||'').toLowerCase());
+  })();
 
+  const uRes = await client.query(`SELECT id, total_points, unspent_points FROM users WHERE id=$1 FOR UPDATE`, [id]);
+  const u = uRes.rows[0];
   const before = u.unspent_points;
   const after  = u.unspent_points + delta;
 
   await client.query(
     'UPDATE users SET total_points = total_points + $1, unspent_points = unspent_points + $1, updated_at=NOW() WHERE id=$2',
-    [delta, u.id]
+    [delta, id]
   );
 
   await client.query(`
     INSERT INTO point_transactions (user_id, type, delta_points, points_before, points_after)
     VALUES ($1, 'grant', $2, $3, $4)
-  `, [u.id, delta, before, after]);
+  `, [id, delta, before, after]);
 }
 
 // ---------- OAuth ----------
@@ -193,16 +249,16 @@ app.get('/auth/twitch/callback',
       </style>
       <div class="box">
         <h2>✅ Login effettuato con successo</h2>
-        <p class="muted">Puoi chiudere questa finestra e tornare al sito.</p>
-        <button class="btn" onclick="tryClose()">Chiudi</button>
+        <p class="muted">Puoi chiudere questa finestra.</p>
+        <button class="btn" onclick="closeNow()">Chiudi</button>
       </div>
       <script>
-        function tryClose(){
+        function closeNow(){
           try{ if(window.opener) window.opener.postMessage({type:'login'}, '*'); }catch(_){}
           try{ if(window.parent && window.parent !== window) window.parent.postMessage({type:'login'}, '*'); }catch(_){}
           try{ window.close(); }catch(_){}
         }
-        setTimeout(tryClose, 600);
+        setTimeout(closeNow, 400);
       </script>
     `);
   }
@@ -215,16 +271,22 @@ app.get('/logout', (req, res) => {
     req.logout?.(()=>{});
     req.session?.destroy(()=>{});
   }catch(_){}
+  const isPopup = req.query.popup === '1';
   res.type('html').send(`
     <!doctype html><meta charset="utf-8"><title>Logout</title>
     <style>body{margin:0;display:grid;place-items:center;height:100vh;background:#0f0f14;color:#e9e9f4;
-    font:15px system-ui,Segoe UI,Roboto,Arial}.box{background:#14141c;border:1px solid rgba(255,255,255,.15);
-    border-radius:12px;padding:18px 20px;max-width:520px;text-align:center}</style>
-    <div class="box"><h2>👋 Logout effettuato</h2><p>Puoi chiudere questa finestra.</p></div>
+    font:16px system-ui,Segoe UI,Roboto,Arial}.box{background:#14141c;border:1px solid rgba(255,255,255,.15);
+    border-radius:12px;padding:22px 24px;max-width:520px;text-align:center}</style>
+    <div class="box"><h2>👋 Logout effettuato con successo</h2><p>Puoi chiudere questa finestra.</p></div>
     <script>
-      try{ if(window.opener) window.opener.postMessage({type:'logout'}, '*'); }catch(_){}
-      try{ if(window.parent && window.parent !== window) window.parent.postMessage({type:'logout'}, '*'); }catch(_){}
-      setTimeout(()=>{ try{window.close()}catch(_){} }, 600);
+      (function(){
+        function notify(){
+          try{ if(window.opener) window.opener.postMessage({type:'logout'}, '*'); }catch(_){}
+          try{ if(window.parent && window.parent !== window) window.parent.postMessage({type:'logout'}, '*'); }catch(_){}
+        }
+        notify();
+        ${isPopup ? "setTimeout(()=>{ try{window.close()}catch(_){ } }, 300);" : ""}
+      })();
     </script>
   `);
 });
@@ -357,19 +419,19 @@ app.post('/inventory/use', requireAuth, async (req, res) => {
 });
 
 // ---------- EventSub ----------
-function verifyTwitchSignature(req, rawBody) {
+function verifyTwitchSignature(req) {
   const id = req.header('Twitch-Eventsub-Message-Id') || '';
   const ts = req.header('Twitch-Eventsub-Message-Timestamp') || '';
   const sig = req.header('Twitch-Eventsub-Message-Signature') || ''; // "sha256=."
-  const message = id + ts + rawBody;
+  const message = id + ts + (req.rawBody || '');
   const hmac = crypto.createHmac('sha256', TWITCH_EVENTSUB_SECRET || '');
   const computed = 'sha256=' + hmac.update(message).digest('hex');
   return (sig && crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(sig)));
 }
 
-app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res) => {
-  const raw = req.body instanceof Buffer ? req.body.toString('utf8') : (typeof req.body === 'string' ? req.body : '');
+app.post('/eventsub', (req, res) => {
   const type = req.header('Twitch-Eventsub-Message-Type') || '';
+  const raw = req.rawBody || '';
 
   if (type === 'webhook_callback_verification') {
     try {
@@ -378,7 +440,7 @@ app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res
     } catch { return res.status(400).send('bad_request'); }
   }
 
-  if (!verifyTwitchSignature(req, raw)) {
+  if (!verifyTwitchSignature(req)) {
     return res.status(403).type('text/plain').send('Invalid signature');
   }
 
@@ -388,27 +450,29 @@ app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res
   if (type === 'notification') {
     const subType = payload.subscription?.type;
     const ev = payload.event || {};
-    try {
+    (async () => {
       const client = await pool.connect();
-      await client.query('BEGIN');
+      try {
+        await client.query('BEGIN');
 
-      if (subType === 'channel.subscribe') {
-        const twitch_id = String(ev.user_id || '');
-        const username = ev.user_name || ev.user_login || null;
-        if (twitch_id) await grantPointsByTwitchId(client, twitch_id, username, 1);
-      } else if (subType === 'channel.subscription.gift') {
-        const isAnon = !!ev.is_anonymous;
-        if (!isAnon) {
+        if (subType === 'channel.subscribe') {
           const twitch_id = String(ev.user_id || '');
           const username = ev.user_name || ev.user_login || null;
-          const n = Number(ev.total) > 0 ? Number(ev.total) : 1;
-          if (twitch_id) await grantPointsByTwitchId(client, twitch_id, username, n);
+          if (twitch_id) await grantPointsByTwitchId(client, twitch_id, username, 1);
+        } else if (subType === 'channel.subscription.gift') {
+          const isAnon = !!ev.is_anonymous;
+          if (!isAnon) {
+            const twitch_id = String(ev.user_id || '');
+            const username = ev.user_name || ev.user_login || null;
+            const n = Number(ev.total) > 0 ? Number(ev.total) : 1;
+            if (twitch_id) await grantPointsByTwitchId(client, twitch_id, username, n);
+          }
         }
-      }
 
-      await client.query('COMMIT');
-      client.release();
-    } catch (e) { console.error('EventSub handler error:', e); }
+        await client.query('COMMIT');
+      } catch (e) { await client.query('ROLLBACK'); console.error('EventSub handler error:', e); }
+      finally { client.release(); }
+    })();
   }
 
   res.status(200).type('text/plain').send('ok');
@@ -418,7 +482,7 @@ app.post('/eventsub', express.raw({ type: 'application/json' }), async (req, res
 const adminRoutes = require('./admin-routes')(pool, ADMIN_LOGIN);
 app.use('/admin', requireAuth, requireAdmin, adminRoutes);
 
-// ---------- Static (optional for health / simple pages) ----------
+// ---------- Static (optional) ----------
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.listen(PORT, () => {
