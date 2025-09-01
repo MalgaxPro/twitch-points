@@ -1,4 +1,4 @@
-// server.js (API per Malgax Points) — v2.2 (fix username_lc generated column)
+// server.js (API per Malgax Points) — v2.3 (fix ordine middleware di sessione)
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
@@ -28,16 +28,26 @@ app.use(cors({
   credentials: true
 }));
 
-const rawBodySaver = (req, res, buf) => { if (buf && buf.length) req.rawBody = buf.toString('utf8'); };
-app.use(express.json({ limit: '1mb', verify: rawBodySaver }));
-app.use(express.urlencoded({ extended: true }));
-
+// *** IMPORTANTE ***: montiamo la sessione PRIMA dei body parser e di passport
 app.use(session({
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
   cookie: { httpOnly: true, sameSite: 'none', secure: true, maxAge: 1000*60*60*24*30 }
 }));
+
+// Raw body per EventSub
+const rawBodySaver = (req, res, buf) => { if (buf && buf.length) req.rawBody = buf.toString('utf8'); };
+app.use(express.json({ limit: '1mb', verify: rawBodySaver }));
+app.use(express.urlencoded({ extended: true }));
+
+// Piccolo guard per capire se la sessione manca (debug)
+app.use((req,res,next)=>{
+  if(!req.session){
+    console.error('[WARN] req.session mancante su', req.method, req.originalUrl);
+  }
+  next();
+});
 
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
@@ -46,14 +56,11 @@ passport.deserializeUser((obj, done) => done(null, obj));
 
 async function mergeUsersOnLogin(client, twitch_id, username){
   const uname_lc = String(username||'').toLowerCase();
-  // 1) utente già legato a twitch_id?
   const byTid = await client.query(`SELECT * FROM users WHERE twitch_id=$1`, [twitch_id]);
   if (byTid.rows[0]) {
-    // aggiorna solo display name; NON toccare username_lc (potrebbe essere colonna generata)
     await client.query(`UPDATE users SET username=$1, updated_at=NOW() WHERE id=$2`, [username, byTid.rows[0].id]);
     return byTid.rows[0].id;
   }
-  // 2) cerca duplicati case-insensitive usando username_lc SE presente, altrimenti LOWER(username)
   const dup = await client.query(`
     SELECT *, COALESCE(username_lc, LOWER(username)) AS uname_lc
     FROM users
@@ -62,9 +69,7 @@ async function mergeUsersOnLogin(client, twitch_id, username){
   `, [uname_lc]);
   if (dup.rows[0]) {
     const primary = dup.rows[0];
-    // collega twitch_id al primary e aggiorna solo username
     await client.query(`UPDATE users SET twitch_id=$1, username=$2, updated_at=NOW() WHERE id=$3`, [twitch_id, username, primary.id]);
-    // unisci eventuali altri duplicati
     for (let i=1;i<dup.rows.length;i++){
       const other = dup.rows[i];
       if (other.id === primary.id) continue;
@@ -88,7 +93,6 @@ async function mergeUsersOnLogin(client, twitch_id, username){
     }
     return primary.id;
   }
-  // 3) nessun duplicato: crea nuovo (NON scrivere username_lc se è colonna generata)
   const ins = await client.query(`
     INSERT INTO users (twitch_id, username)
     VALUES ($1,$2)
@@ -191,7 +195,6 @@ function requireAdmin(req, res, next) {
 }
 
 async function grantPointsByTwitchId(client, twitch_id, username, delta) {
-  // collega/crea utente per twitch_id, facendo merge case-insensitive su username
   const id = await (async ()=>{
     const row = await client.query(`SELECT id FROM users WHERE twitch_id=$1`, [twitch_id]);
     if (row.rows[0]) return row.rows[0].id;
@@ -214,8 +217,9 @@ async function grantPointsByTwitchId(client, twitch_id, username, delta) {
   `, [id, delta, before, after]);
 }
 
-// OAuth
 app.get('/auth/twitch', (req, res, next) => {
+  // assicurati che la sessione esista
+  if(!req.session){ console.error('[AUTH] Sessione assente prima di authenticate'); }
   const isPopup = req.query.popup === '1';
   req.session.isPopup = isPopup;
   const state = isPopup ? 'popup' : 'redir';
@@ -225,6 +229,7 @@ app.get('/auth/twitch', (req, res, next) => {
 app.get('/auth/twitch/callback',
   passport.authenticate('twitch', { failureRedirect: '/auth-failed.html' }),
   async (req, res) => {
+    if(!req.session){ console.error('[AUTH] Sessione assente dopo authenticate'); }
     try{
       const name = req.user?.username || '';
       res.cookie('user_login', name, { sameSite:'none', secure:true });
