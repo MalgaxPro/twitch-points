@@ -1,6 +1,6 @@
 {
   "name": "twitch-points-api",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "commonjs",
   "engines": {
@@ -17,7 +17,7 @@
     "express": "^4.19.2",
     "express-session": "^1.18.0",
     "passport": "^0.7.0",
-    "passport-twitch-new": "^0.1.1",
+    "passport-twitch-new": "^0.0.3",
     "pg": "^8.12.0"
   }
 }
