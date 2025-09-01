@@ -1,4 +1,4 @@
-// server.js (API per Malgax Points) — v2.1
+// server.js (API per Malgax Points) — v2.2 (fix username_lc generated column)
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
@@ -14,10 +14,10 @@ const {
   SESSION_SECRET = 'dev_secret_change_me',
   TWITCH_CLIENT_ID,
   TWITCH_CLIENT_SECRET,
-  TWITCH_CALLBACK_URL,       // es: https://api.malgax.com/auth/twitch/callback
-  TWITCH_EVENTSUB_SECRET,    // segreto per validare EventSub
-  DATABASE_URL,              // stringa Neon
-  ADMIN_LOGIN = 'malgax'     // login twitch che può usare /admin/*
+  TWITCH_CALLBACK_URL,
+  TWITCH_EVENTSUB_SECRET,
+  DATABASE_URL,
+  ADMIN_LOGIN = 'malgax'
 } = process.env;
 
 const app = express();
@@ -28,7 +28,6 @@ app.use(cors({
   credentials: true
 }));
 
-// Per EventSub raw
 const rawBodySaver = (req, res, buf) => { if (buf && buf.length) req.rawBody = buf.toString('utf8'); };
 app.use(express.json({ limit: '1mb', verify: rawBodySaver }));
 app.use(express.urlencoded({ extended: true }));
@@ -45,27 +44,31 @@ const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorize
 passport.serializeUser((user, done) => done(null, { id: user.id, twitch_id: user.twitch_id, username: user.username }));
 passport.deserializeUser((obj, done) => done(null, obj));
 
-async function mergeUsersOnLogin(client, twitch_id, username, username_lc){
-  // 1) esiste per twitch_id?
+async function mergeUsersOnLogin(client, twitch_id, username){
+  const uname_lc = String(username||'').toLowerCase();
+  // 1) utente già legato a twitch_id?
   const byTid = await client.query(`SELECT * FROM users WHERE twitch_id=$1`, [twitch_id]);
   if (byTid.rows[0]) {
-    // aggiorna username se cambiato
-    await client.query(`UPDATE users SET username=$1, username_lc=LOWER($1), updated_at=NOW() WHERE id=$2`, [username, byTid.rows[0].id]);
+    // aggiorna solo display name; NON toccare username_lc (potrebbe essere colonna generata)
+    await client.query(`UPDATE users SET username=$1, updated_at=NOW() WHERE id=$2`, [username, byTid.rows[0].id]);
     return byTid.rows[0].id;
   }
-  // 2) cerca duplicati per username_lc
-  const dup = await client.query(`SELECT * FROM users WHERE username_lc=$1 ORDER BY (total_points + unspent_points) DESC NULLS LAST`, [username_lc]);
+  // 2) cerca duplicati case-insensitive usando username_lc SE presente, altrimenti LOWER(username)
+  const dup = await client.query(`
+    SELECT *, COALESCE(username_lc, LOWER(username)) AS uname_lc
+    FROM users
+    WHERE COALESCE(username_lc, LOWER(username)) = $1
+    ORDER BY (COALESCE(total_points,0) + COALESCE(unspent_points,0)) DESC NULLS LAST
+  `, [uname_lc]);
   if (dup.rows[0]) {
     const primary = dup.rows[0];
-    // collega twitch_id al primary
-    await client.query(`UPDATE users SET twitch_id=$1, username=$2, username_lc=LOWER($2), updated_at=NOW() WHERE id=$3`, [twitch_id, username, primary.id]);
+    // collega twitch_id al primary e aggiorna solo username
+    await client.query(`UPDATE users SET twitch_id=$1, username=$2, updated_at=NOW() WHERE id=$3`, [twitch_id, username, primary.id]);
     // unisci eventuali altri duplicati
     for (let i=1;i<dup.rows.length;i++){
       const other = dup.rows[i];
       if (other.id === primary.id) continue;
-      // porta transazioni
       await client.query(`UPDATE point_transactions SET user_id=$1 WHERE user_id=$2`, [primary.id, other.id]);
-      // unisci inventario
       const inv = await client.query(`SELECT item_id, quantity FROM user_items WHERE user_id=$1`, [other.id]);
       for (const r of inv.rows){
         await client.query(`
@@ -75,22 +78,20 @@ async function mergeUsersOnLogin(client, twitch_id, username, username_lc){
         `, [primary.id, r.item_id, r.quantity]);
       }
       await client.query(`DELETE FROM user_items WHERE user_id=$1`, [other.id]);
-      // somma counters
       await client.query(`
         UPDATE users
         SET total_points = COALESCE(total_points,0) + COALESCE($1,0),
             unspent_points = COALESCE(unspent_points,0) + COALESCE($2,0)
         WHERE id=$3
       `, [other.total_points||0, other.unspent_points||0, primary.id]);
-      // elimina duplicato
       await client.query(`DELETE FROM users WHERE id=$1`, [other.id]);
     }
     return primary.id;
   }
-  // 3) nessuno: crea nuovo
+  // 3) nessun duplicato: crea nuovo (NON scrivere username_lc se è colonna generata)
   const ins = await client.query(`
-    INSERT INTO users (twitch_id, username, username_lc)
-    VALUES ($1,$2,LOWER($2))
+    INSERT INTO users (twitch_id, username)
+    VALUES ($1,$2)
     RETURNING id
   `, [twitch_id, username]);
   return ins.rows[0].id;
@@ -104,11 +105,10 @@ passport.use(new TwitchStrategy({
 }, async (accessToken, refreshToken, profile, done) => {
   const tid = String(profile.id);
   const uname = profile.display_name || profile.username || profile.login || 'Utente';
-  const uname_lc = String(uname).toLowerCase();
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const userId = await mergeUsersOnLogin(client, tid, uname, uname_lc);
+    const userId = await mergeUsersOnLogin(client, tid, uname);
     const { rows } = await client.query(`SELECT id, twitch_id, username, total_points, unspent_points FROM users WHERE id=$1`, [userId]);
     await client.query('COMMIT');
     done(null, rows[0]);
@@ -121,7 +121,6 @@ passport.use(new TwitchStrategy({
 app.use(passport.initialize());
 app.use(passport.session());
 
-// ---------- DB INIT ----------
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -135,7 +134,6 @@ async function initDb() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tid ON users(twitch_id);
-    CREATE INDEX IF NOT EXISTS idx_users_uname_lc ON users(LOWER(username_lc));
 
     CREATE TABLE IF NOT EXISTS items (
       id SERIAL PRIMARY KEY,
@@ -181,7 +179,6 @@ async function initDb() {
 }
 initDb().catch(err => { console.error('DB init error:', err); process.exit(1); });
 
-// ---------- Utils ----------
 function requireAuth(req, res, next) {
   if (req.isAuthenticated && req.isAuthenticated()) return next();
   return res.status(401).json({ error: 'unauthorized' });
@@ -194,13 +191,11 @@ function requireAdmin(req, res, next) {
 }
 
 async function grantPointsByTwitchId(client, twitch_id, username, delta) {
-  const uname = username || null;
-  // collega/crea utente per twitch_id preservando username esistente
+  // collega/crea utente per twitch_id, facendo merge case-insensitive su username
   const id = await (async ()=>{
     const row = await client.query(`SELECT id FROM users WHERE twitch_id=$1`, [twitch_id]);
     if (row.rows[0]) return row.rows[0].id;
-    // se non esiste, prova merge su username_lc
-    return await mergeUsersOnLogin(client, twitch_id, uname, String(uname||'').toLowerCase());
+    return await mergeUsersOnLogin(client, twitch_id, username || null);
   })();
 
   const uRes = await client.query(`SELECT id, total_points, unspent_points FROM users WHERE id=$1 FOR UPDATE`, [id]);
@@ -219,7 +214,7 @@ async function grantPointsByTwitchId(client, twitch_id, username, delta) {
   `, [id, delta, before, after]);
 }
 
-// ---------- OAuth ----------
+// OAuth
 app.get('/auth/twitch', (req, res, next) => {
   const isPopup = req.query.popup === '1';
   req.session.isPopup = isPopup;
@@ -231,7 +226,6 @@ app.get('/auth/twitch/callback',
   passport.authenticate('twitch', { failureRedirect: '/auth-failed.html' }),
   async (req, res) => {
     try{
-      // Scrivi cookie leggibili dal front
       const name = req.user?.username || '';
       res.cookie('user_login', name, { sameSite:'none', secure:true });
       res.cookie('user_login_lc', String(name).toLowerCase(), { sameSite:'none', secure:true });
@@ -291,7 +285,6 @@ app.get('/logout', (req, res) => {
   `);
 });
 
-// ---------- API ----------
 app.get('/me', async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'unauthorized' });
   try {
@@ -315,7 +308,6 @@ app.get('/api/leaderboard/unspent', (req, res) =>
     .then(r => res.json(r.rows)).catch(_ => res.status(500).json({ error: 'server_error' }))
 );
 
-// ---------- SHOP & INVENTARIO ----------
 app.get('/shop/items', async (req, res) => {
   const { rows } = await pool.query(
     `SELECT id, slug, name, kind, cost_points, image_url, description
@@ -418,11 +410,10 @@ app.post('/inventory/use', requireAuth, async (req, res) => {
   } finally { client.release(); }
 });
 
-// ---------- EventSub ----------
 function verifyTwitchSignature(req) {
   const id = req.header('Twitch-Eventsub-Message-Id') || '';
   const ts = req.header('Twitch-Eventsub-Message-Timestamp') || '';
-  const sig = req.header('Twitch-Eventsub-Message-Signature') || ''; // "sha256=."
+  const sig = req.header('Twitch-Eventsub-Message-Signature') || '';
   const message = id + ts + (req.rawBody || '');
   const hmac = crypto.createHmac('sha256', TWITCH_EVENTSUB_SECRET || '');
   const computed = 'sha256=' + hmac.update(message).digest('hex');
@@ -478,11 +469,9 @@ app.post('/eventsub', (req, res) => {
   res.status(200).type('text/plain').send('ok');
 });
 
-// ---------- Admin routes ----------
 const adminRoutes = require('./admin-routes')(pool, ADMIN_LOGIN);
 app.use('/admin', requireAuth, requireAdmin, adminRoutes);
 
-// ---------- Static (optional) ----------
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.listen(PORT, () => {
