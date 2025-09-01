@@ -183,6 +183,112 @@ app.get('/admin/used-cards', ensureIsAdmin, async (req, res) => {
   }
 });
 
+// ======== TWITCH OAUTH (login popup) ========
+const TW_CID  = process.env.TWITCH_CLIENT_ID;
+const TW_SEC  = process.env.TWITCH_CLIENT_SECRET;
+const TW_RED  = process.env.TWITCH_REDIRECT_URI || 'https://api.malgax.com/auth/twitch/callback';
+const APP_ORI = process.env.APP_ORIGIN || 'https://www.malgax.com';
+
+// piccola utility per state anti-CSRF
+function randState(){ return [...crypto.getRandomValues(new Uint8Array(24))].map(b=>b.toString(16).padStart(2,'0')).join(''); }
+
+// per Node < 20:
+const nodeMajor = parseInt(process.versions.node.split('.')[0],10);
+const _fetch = (global.fetch && nodeMajor>=18) ? global.fetch : (...args)=>import('node-fetch').then(m=>m.default(...args));
+const _crypto = (global.crypto && global.crypto.getRandomValues) ? global.crypto : require('crypto').webcrypto;
+
+// GET /auth/twitch
+app.get('/auth/twitch', async (req, res) => {
+  try{
+    const returnTo = req.query.return_to || req.get('referer') || (APP_ORI + '/');
+    const stateObj = { s: [..._crypto.getRandomValues(new Uint8Array(12))].map(b=>b.toString(16).padStart(2,'0')).join(''), r: returnTo };
+    const state = Buffer.from(JSON.stringify(stateObj)).toString('base64url');
+
+    const params = new URLSearchParams({
+      client_id: TW_CID,
+      redirect_uri: TW_RED,
+      response_type: 'code',
+      scope: 'user:read:email', // opzionale, per prendere email; per il login base non è indispensabile
+      state
+    });
+    return res.redirect('https://id.twitch.tv/oauth2/authorize?' + params.toString());
+  }catch(e){
+    console.error('auth/twitch err', e);
+    res.status(500).send('Auth error');
+  }
+});
+
+// GET /auth/twitch/callback
+app.get('/auth/twitch/callback', async (req, res) => {
+  try{
+    const { code, state } = req.query;
+    if(!code || !state) return res.status(400).send('Missing code/state');
+
+    let returnTo = APP_ORI + '/';
+    try{
+      const st = JSON.parse(Buffer.from(String(state), 'base64url').toString('utf8'));
+      if (st?.r) returnTo = st.r;
+    }catch{}
+
+    // Scambio code → token
+    const body = new URLSearchParams({
+      client_id: TW_CID,
+      client_secret: TW_SEC,
+      code: code,
+      grant_type: 'authorization_code',
+      redirect_uri: TW_RED
+    });
+
+    const tok = await _fetch('https://id.twitch.tv/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type':'application/x-www-form-urlencoded' },
+      body
+    }).then(r=>r.json());
+
+    if(!tok.access_token) {
+      console.error('token error', tok);
+      return res.redirect(returnTo);
+    }
+
+    // Prendo l'utente
+    const user = await _fetch('https://api.twitch.tv/helix/users', {
+      headers: {
+        'Authorization': `Bearer ${tok.access_token}`,
+        'Client-Id': TW_CID
+      }
+    }).then(r=>r.json());
+
+    const login = (user?.data && user.data[0]?.login) || '';
+    if(!login){
+      console.error('no twitch login', user);
+      return res.redirect(returnTo);
+    }
+
+    // Set cookie di sessione lato API (cross-site verso www)
+    res.cookie('user_login', login.toLowerCase(), {
+      httpOnly: false,         // il frontend non legge mai direttamente, ma teniamolo semplice
+      sameSite: 'none',        // necessario per cookie cross-site
+      secure: true,            // richiesto da SameSite=None
+      path: '/',
+      maxAge: 7*24*60*60*1000  // 7 giorni
+    });
+
+    // Torno alla pagina che aveva aperto il popup
+    return res.redirect(returnTo);
+  }catch(e){
+    console.error('auth/callback err', e);
+    res.status(500).send('Auth error');
+  }
+});
+
+// GET /logout
+app.get('/logout', (req, res) => {
+  const returnTo = req.query.return_to || APP_ORI + '/';
+  res.clearCookie('user_login', { path:'/', sameSite:'none', secure:true });
+  res.redirect(returnTo);
+});
+
+
 // ---------- ADMIN: segna fatto ----------
 app.post('/admin/used-cards/complete', ensureIsAdmin, async (req, res) => {
   try {
