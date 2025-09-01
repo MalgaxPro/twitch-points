@@ -1,5 +1,11 @@
 {
-  "engines": { "node": ">=18 <25" },
+  "name": "twitch-points-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18 <25"
+  },
   "scripts": {
     "start": "node server.js",
     "render-build": "echo 'build step not required'",
