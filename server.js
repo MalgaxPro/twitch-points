@@ -1,6 +1,18 @@
 // server.js
 require('dotenv').config();
 
+// index.js / server.js
+const express = require('express');
+const app = express();
+app.use(express.json());
+
+const { Pool } = require('pg');
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+function getUserLogin(req){ return (req.user?.login || req.user?.username || '').toLowerCase(); }
+
+require('./admin-routes')(app, pool, getUserLogin);
+
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
