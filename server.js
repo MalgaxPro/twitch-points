@@ -1,17 +1,27 @@
 // server.js
 require('dotenv').config();
 
-// index.js / server.js
+// Se non già presenti:
 const express = require('express');
 const app = express();
 app.use(express.json());
 
 const { Pool } = require('pg');
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
-function getUserLogin(req){ return (req.user?.login || req.user?.username || '').toLowerCase(); }
+// Ricava il login dell'utente loggato dal tuo auth (adatta se diverso)
+function getUserLogin(req){
+  return (req.user?.login || req.user?.username || '').toLowerCase();
+}
 
+// IMPORTA le nuove rotte admin
 require('./admin-routes')(app, pool, getUserLogin);
+
+// ...resto delle tue rotte...
+
 
 const express = require('express');
 const path = require('path');
