@@ -471,16 +471,21 @@ app.post('/eventsub', (req, res) => {
         await client.query('BEGIN');
 
         if (subType === 'channel.subscribe') {
-          const twitch_id = String(ev.user_id || '');
-          const username = ev.user_name || ev.user_login || null;
-          if (twitch_id) await grantPointsByTwitchId(client, twitch_id, username, 1);
-        } else if (subType === 'channel.subscription.gift') {
-          const isAnon = !!ev.is_anonymous;
-          if (!isAnon) {
+          // Skip awarding points if it's a gifted sub received (recipient)
+          const isGift = ev.is_gift === true || ev.is_gift === 1 || ev.is_gift === 'true';
+          if (!isGift) {
             const twitch_id = String(ev.user_id || '');
             const username = ev.user_name || ev.user_login || null;
-            const n = Number(ev.total) > 0 ? Number(ev.total) : 1;
-            if (twitch_id) await grantPointsByTwitchId(client, twitch_id, username, n);
+            if (twitch_id) await grantPointsByTwitchId(client, twitch_id, username, 1);
+          }
+        } else if (subType === 'channel.subscription.gift') {
+          // Award points ONLY to the gifter (not recipients). Ignore anonymous gifts.
+          const isAnon = !!ev.is_anonymous;
+          if (!isAnon) {
+            const gifter_id = String(ev.user_id || ev.gifter_user_id || '');
+            const gifter_name = ev.user_name || ev.gifter_user_name || ev.user_login || ev.gifter_user_login || null;
+            const count = (Number(ev.total) || Number(ev.quantity) || Number(ev.gifts) || 1);
+            if (gifter_id) await grantPointsByTwitchId(client, gifter_id, gifter_name, count);
           }
         }
 
