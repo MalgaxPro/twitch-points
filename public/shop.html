@@ -89,16 +89,8 @@
           });
           if(res.status===401){ openPop(LOGIN); return; }
           const j=await res.json();
-          if(!res.ok){
-            const msg = (j && (j.error||'')).toLowerCase();
-            if(msg.includes('punti insufficienti')){
-              alert('non hai punti');
-            }else{
-              alert('Errore: '+(j && j.error ? j.error : 'purchase_failed'));
-            }
-            return;
-          }
-          alert('ok');
+          if(!res.ok){ if((j.error||'').toLowerCase().includes('punti insufficienti')){showToast('non hai punti','error');}else{showToast('errore','error');} return; }
+          showToast('ok','success');
           paintMe();
         });
         grid.appendChild(el);
@@ -106,5 +98,28 @@
     }
     load();
   </script>
+
+  <style>
+    .toast-container{position:fixed;right:16px;bottom:16px;z-index:9999;display:flex;flex-direction:column;gap:8px}
+    .toast{min-width:160px;max-width:260px;padding:10px 12px;border-radius:10px;color:#fff;font:600 14px system-ui,Segoe UI,Roboto,Arial,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.25);opacity:.98;transform:translateY(0);transition:opacity .2s ease,transform .2s ease}
+    .toast.success{background:#2e7d32;}
+    .toast.error{background:#c62828;}
+  </style>
+  <div id="toast-root" class="toast-container" aria-live="polite" aria-atomic="true"></div>
+  <script>
+    function showToast(msg, type='success'){
+      try{
+        const root = document.getElementById('toast-root');
+        if(!root) return alert(msg);
+        const el = document.createElement('div');
+        el.className = 'toast '+(type||'success');
+        el.textContent = msg;
+        root.appendChild(el);
+        setTimeout(()=>{ el.style.opacity='0'; el.style.transform='translateY(6px)'; }, 1800);
+        setTimeout(()=>{ el.remove(); }, 2200);
+      }catch(_){ try{ alert(msg); }catch(__){} }
+    }
+  </script>
+
 </body>
 </html>
