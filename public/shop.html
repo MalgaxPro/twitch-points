@@ -89,8 +89,16 @@
           });
           if(res.status===401){ openPop(LOGIN); return; }
           const j=await res.json();
-          if(!res.ok){ alert('Errore: '+(j.error||'purchase_failed')); return; }
-          alert(`Acquistato: ${it.name} (-${it.cost_points} pt)`);
+          if(!res.ok){
+            const msg = (j && (j.error||'')).toLowerCase();
+            if(msg.includes('punti insufficienti')){
+              alert('non hai punti');
+            }else{
+              alert('Errore: '+(j && j.error ? j.error : 'purchase_failed'));
+            }
+            return;
+          }
+          alert('ok');
           paintMe();
         });
         grid.appendChild(el);
