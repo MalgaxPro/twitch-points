@@ -20,7 +20,7 @@
     .head{ padding:14px 16px; border-bottom:1px solid rgba(255,255,255,.08); display:flex; align-items:center; justify-content:space-between; gap:10px }
     .title{ margin:0; font-size:18px; font-weight:800 }
     .status{ font-size:13px; color:var(--muted) }
-    .panel{ padding:10px 12px 16px; overflow:auto }
+    .panel{ padding:10px 12px 16px; /* overflow set dynamically when >20 righe */ }
     table{ width:100%; border-collapse:collapse; }
     th, td{ padding:10px 8px; text-align:left; border-bottom:1px solid rgba(255,255,255,.06); }
     th{ font-size:13px; color:#d6d6e8; letter-spacing:.2px; }
@@ -50,13 +50,29 @@
   <script>
     const API = location.origin.includes('api.malgax.com') ? location.origin : 'https://api.malgax.com';
 
+    function applyScrollIfNeeded(panel, table, rowsCount){
+      if(rowsCount > 20){
+        const tr = table.tBodies[0]?.rows[0];
+        const th = table.tHead;
+        const rowH = tr ? tr.getBoundingClientRect().height : 38;
+        const headH = th ? th.getBoundingClientRect().height : 40;
+        const maxH = Math.ceil(headH + (rowH * 20) + 16);
+        panel.style.maxHeight = maxH + 'px';
+        panel.style.overflowY = 'auto';
+      } else {
+        panel.style.maxHeight = '';
+        panel.style.overflowY = '';
+      }
+    }
+
     async function loadUnspent(){
       const panel = document.getElementById('panel');
       try{
         const res = await fetch(`${API}/api/leaderboard/unspent`, { cache:'no-store' });
         if(!res.ok) throw new Error('HTTP '+res.status);
-        const data = await res.json();
-        if(!Array.isArray(data) || data.length===0){
+        let data = await res.json();
+        data = Array.isArray(data) ? data.filter(r => Number(r.points) > 0) : [];
+        if(data.length===0){
           panel.innerHTML = '<div class="empty">Nessun dato in classifica.</div>';
           return;
         }
@@ -71,6 +87,8 @@
             <thead><tr><th>#</th><th>Utente</th><th style="text-align:right">Punti</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>`;
+        const table = panel.querySelector('table');
+        applyScrollIfNeeded(panel, table, data.length);
       }catch(e){
         console.error('Unspent error:', e);
         panel.innerHTML = '<div class="err">Errore nel caricamento della classifica.</div>';
