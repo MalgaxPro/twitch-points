@@ -75,11 +75,11 @@
           <tr>
             <td class="rank">${String(i+1).padStart(2,'0')}</td>
             <td class="user">${(r.username||'Utente')}</td>
-            <td class="pts">${Number(r.points||0)}</td>
+            <td class="pts">${Number(r.points||0) / 2}</td>
           </tr>`).join('');
         panel.innerHTML = `
           <table aria-label="Top Donator">
-            <thead><tr><th>#</th><th>Utente</th><th style="text-align:right">Punti</th></tr></thead>
+            <thead><tr><th>#</th><th>Utente</th><th style="text-align:right">Sub</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>`;
         const table = panel.querySelector('table');

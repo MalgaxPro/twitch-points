@@ -476,7 +476,7 @@ app.post('/eventsub', (req, res) => {
           if (!isGift) {
             const twitch_id = String(ev.user_id || '');
             const username = ev.user_name || ev.user_login || null;
-            if (twitch_id) await grantPointsByTwitchId(client, twitch_id, username, 1);
+            if (twitch_id) await grantPointsByTwitchId(client, twitch_id, username, 2);
           }
         } else if (subType === 'channel.subscription.gift') {
           // Award points ONLY to the gifter (not recipients). Ignore anonymous gifts.
@@ -485,7 +485,7 @@ app.post('/eventsub', (req, res) => {
             const gifter_id = String(ev.user_id || ev.gifter_user_id || '');
             const gifter_name = ev.user_name || ev.gifter_user_name || ev.user_login || ev.gifter_user_login || null;
             const count = (Number(ev.total) || Number(ev.quantity) || Number(ev.gifts) || 1);
-            if (gifter_id) await grantPointsByTwitchId(client, gifter_id, gifter_name, count);
+            if (gifter_id) await grantPointsByTwitchId(client, gifter_id, gifter_name, count * 2);
           }
         }
 
